@@ -437,6 +437,12 @@ function normalizeLeadingCheckGlyph(line: string): string {
 	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)[✓✔]((?:\x1b\[[0-9;]*m)*)(?=\s)/, "$1●$2");
 }
 
+function stripOuterBackgroundAnsi(line: string): string {
+	return line
+		.replace(/^\x1b\[(?:49|4[0-7]|10[0-7]|48;5;\d+|48;2;\d+;\d+;\d+)m/, "")
+		.replace(/\x1b\[49m$/, "");
+}
+
 function firstImageBlockStart(lines: string[]): number {
 	const imageLineIndex = lines.findIndex(isTerminalImageLine);
 	if (imageLineIndex === -1) return -1;
@@ -842,7 +848,7 @@ function patchGlobalToolBorders(): void {
 		const indentTool = shouldIndentToolExecution(this);
 		const core = textLines.map((line) => {
 			const normalized = normalizeLeadingCheckGlyph(line);
-			return clampLineWidth(indentTool && normalized ? ` ${normalized}` : normalized, width);
+			return clampLineWidth(stripOuterBackgroundAnsi(indentTool && normalized ? ` ${normalized}` : normalized), width);
 		});
 		const spacerLine = " ".repeat(width);
 		let result: string[];
