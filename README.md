@@ -13,7 +13,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Thinking labels** during streaming and final messages, with context sanitization
 - **MCP-aware rendering** with hidden, summary, and preview modes
 - **Configurable output modes** for read, search, bash, and MCP results
-- **Live running previews** that show a few output lines for active tool calls (latest lines for bash), then collapse after completion
+- **Live running previews** that show a few output lines for active tool calls (latest lines for bash), persisting until the next tool/text activity
 - **Subagent completion notifications** restyled to match the same Claude-style tool rows
 - **RTK rewrite integration** that folds rewrite notices into the bash tool row with a muted `(RTK)` badge and expanded-only rewrite details
 - **Transparent tool backgrounds** in `transparent` or `border` mode

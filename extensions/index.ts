@@ -233,12 +233,18 @@ function isToolExecutionLike(value: unknown): value is { toolName: string; toolC
 	return typeof candidate.toolName === "string" && typeof candidate.toolCallId === "string";
 }
 
+function shouldIndentToolExecution(value: unknown): boolean {
+	if (!value || typeof value !== "object") return false;
+	const toolName = (value as Record<string, unknown>).toolName;
+	return typeof toolName === "string" && ["Agent", "Agents", "get_subagent_result", "steer_subagent"].includes(toolName);
+}
+
 function isTerminalImageLine(line: string): boolean {
 	return line.includes(KITTY_IMAGE_PREFIX) || line.includes(ITERM2_IMAGE_PREFIX);
 }
 
 function normalizeLeadingCheckGlyph(line: string): string {
-	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t])*)[✓✔](?=\s)/, "$1●");
+	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)[✓✔]((?:\x1b\[[0-9;]*m)*)(?=\s)/, "$1●$2");
 }
 
 function firstImageBlockStart(lines: string[]): number {
@@ -289,7 +295,11 @@ function patchGlobalToolBorders(): void {
 			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered };
 			return rendered;
 		}
-		const core = textLines.map((line) => clampLineWidth(normalizeLeadingCheckGlyph(line), width));
+		const indentTool = shouldIndentToolExecution(this);
+		const core = textLines.map((line) => {
+			const normalized = normalizeLeadingCheckGlyph(line);
+			return clampLineWidth(indentTool && normalized ? ` ${normalized}` : normalized, width);
+		});
 		const spacerLine = " ".repeat(width);
 		let result: string[];
 
@@ -619,7 +629,8 @@ function formatSubagentNotification(lines: string[], width: number): string[] {
 		const groupLines = formatSubagentNotificationGroup(group);
 		return index === 0 ? groupLines : ["", ...groupLines];
 	});
-	return frameToolLikeLines(formatted, width);
+	const indented = formatted.map((line) => (line ? ` ${line}` : line));
+	return frameToolLikeLines(indented, width);
 }
 
 function patchCustomMessageRender(): void {
@@ -963,6 +974,33 @@ const RTK_ORIGINAL_BASH_COMMANDS = new Map<string, string>();
 const RTK_REWRITES_BY_TOOL_ID = new Map<string, RtkRewriteRecord>();
 const RTK_PENDING_REWRITES: RtkRewriteRecord[] = [];
 const RTK_PENDING_REWRITE_LIMIT = 20;
+const PRESERVED_BASH_PREVIEWS = new Set<string>();
+const BASH_PREVIEW_INVALIDATORS = new Map<string, () => void>();
+
+function preserveBashPreview(ctx: any): void {
+	const toolCallId = typeof ctx?.toolCallId === "string" ? ctx.toolCallId : undefined;
+	if (!toolCallId) return;
+	PRESERVED_BASH_PREVIEWS.add(toolCallId);
+	if (typeof ctx?.invalidate === "function") {
+		BASH_PREVIEW_INVALIDATORS.set(toolCallId, () => ctx.invalidate());
+	}
+}
+
+function clearPreservedBashPreviews(): void {
+	if (PRESERVED_BASH_PREVIEWS.size === 0) return;
+	const invalidators = [...PRESERVED_BASH_PREVIEWS]
+		.map((toolCallId) => BASH_PREVIEW_INVALIDATORS.get(toolCallId))
+		.filter((invalidate): invalidate is () => void => typeof invalidate === "function");
+	PRESERVED_BASH_PREVIEWS.clear();
+	BASH_PREVIEW_INVALIDATORS.clear();
+	for (const invalidate of invalidators) {
+		try { invalidate(); } catch { /* noop */ }
+	}
+}
+
+function shouldPreserveBashPreview(ctx: any): boolean {
+	return typeof ctx?.toolCallId === "string" && PRESERVED_BASH_PREVIEWS.has(ctx.toolCallId);
+}
 
 function normalizeRtkCommandPreview(command: string): string {
 	return command.replace(/\s+/g, " ").trim();
@@ -1084,6 +1122,7 @@ function clearRtkRewriteState(): void {
 	RTK_ORIGINAL_BASH_COMMANDS.clear();
 	RTK_REWRITES_BY_TOOL_ID.clear();
 	RTK_PENDING_REWRITES.length = 0;
+	clearPreservedBashPreviews();
 }
 
 function getWriteWasNewFile(ctx: any, cwd: string, filePath: string, reveal = shouldRevealCallArgs(ctx)): boolean | undefined {
@@ -3047,6 +3086,18 @@ function runningPreviewBlock(
 	return withBranch(`${statusText} ${theme.fg("muted", `(${lineCountLabel(lines.length)})`)}\n${preview}`, theme);
 }
 
+function buildPersistentBashPreview(lines: string[], theme: Theme): string {
+	const limit = liveToolPreviewLimit();
+	if (!liveToolPreviewEnabled() || limit <= 0 || lines.length === 0) return "";
+	const shown = lines.slice(-limit).map((line) => theme.fg("dim", line));
+	let preview = shown.join("\n");
+	const earlier = lines.length - shown.length;
+	if (earlier > 0) {
+		preview = `${theme.fg("muted", `... (${earlier} earlier lines • Ctrl+O to expand)`)}\n${preview}`;
+	}
+	return preview;
+}
+
 function getStringArg(args: any, ...keys: string[]): string {
 	for (const key of keys) {
 		const value = args?.[key];
@@ -4036,7 +4087,14 @@ export default function (pi: ExtensionAPI) {
 		applyThemePaletteIfNeeded(ctx.ui.theme);
 	});
 
+	pi.on("message_update", async (event) => {
+		const content = (event as any)?.message?.content;
+		const hasText = Array.isArray(content) && content.some((block: any) => block?.type === "text" && typeof block.text === "string" && block.text.trim().length > 0);
+		if (hasText) clearPreservedBashPreviews();
+	});
+
 	pi.on("tool_execution_start", async (event) => {
+		clearPreservedBashPreviews();
 		const toolName = (event as any)?.toolName;
 		if (toolName !== "bash") return;
 		trackRtkOriginalBashCommand((event as any)?.toolCallId, (event as any)?.args);
@@ -4120,11 +4178,17 @@ export default function (pi: ExtensionAPI) {
 			}
 			clearBlinkTimer(ctx);
 			setToolStatus(ctx, ctx.isError ? "error" : "success");
+			if (nonEmpty.length > 0 && ctx.state?._bashPreviewReleased !== true) {
+				preserveBashPreview(ctx);
+				if (ctx.state) ctx.state._bashPreviewReleased = true;
+			}
 			const exitMatch = output.match(/exit code: (\d+)/);
 			const exitCode = exitMatch ? Number.parseInt(exitMatch[1], 10) : null;
 			let text = exitCode === null || exitCode === 0 ? theme.fg("success", "Done") : theme.fg("error", `Exit ${exitCode}`);
 			text += theme.fg("muted", ` (${nonEmpty.length} lines)`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " [truncated]");
+			const persistentPreview = shouldPreserveBashPreview(ctx) ? buildPersistentBashPreview(nonEmpty, theme) : "";
+			if (!expanded && persistentPreview) return makeText(ctx.lastComponent, withBranch(`${text}${theme.fg("muted", " • Ctrl+O to expand")}\n${persistentPreview}`, theme));
 			if (!expanded && nonEmpty.length > 0) return makeText(ctx.lastComponent, withBranch(`${text}${theme.fg("muted", " • Ctrl+O to expand")}`, theme));
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(text, theme));
 			const collapsed = bashCollapsedLimit();
