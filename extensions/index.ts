@@ -347,7 +347,7 @@ function getToolGroupOverallStatus(tools: any[]): ToolStatus {
 
 function groupStatusLight(status: ToolStatus): string {
 	const color = status === "success" ? TOOL_STATUS_SUCCESS : status === "error" ? TOOL_STATUS_ERROR : TOOL_STATUS_PENDING;
-	const glyph = status === "pending" ? "○" : "●";
+	const glyph = status === "error" ? "✗" : status === "pending" ? "○" : "●";
 	return `${color}${glyph}${TRANSPARENT_RESET}`;
 }
 
@@ -400,44 +400,64 @@ function removeGroupedToolPrefix(line: string, groupedLabel?: string): string {
 	return trimAnsiLeft(stripGroupedToolLabel(trimAnsiLeft(stripLeadingToolStatus(line)), groupedLabel));
 }
 
+function tintGroupedToolLine(line: string, groupedLabel?: string): string {
+	const plain = stripAnsi(trimAnsiLeft(line));
+	if (!plain) return "";
+	if (groupedLabel) return `${FG_DIM}${plain}${TRANSPARENT_RESET}`;
+	const match = plain.match(/^(\S+)(\s+.*)?$/);
+	if (!match) return `${FG_DIM}${plain}${TRANSPARENT_RESET}`;
+	const title = match[1] ?? plain;
+	const rest = match[2] ?? "";
+	return `${FG_DIM}${title}${TRANSPARENT_RESET}${rest ? `${FG_DIM}${rest}${TRANSPARENT_RESET}` : ""}`;
+}
+
 function getCompactToolLine(tool: any, width: number, groupedLabel?: string): string {
 	const rendered = stripToolChrome(tool.render(Math.max(1, width)))
-		.map((line) => removeGroupedToolPrefix(line, groupedLabel));
-	const content = rendered.find((line) => stripAnsi(line).trim().length > 0) ?? `${tool?.toolName ?? "tool"}`;
+		.map((line) => removeGroupedToolPrefix(line, groupedLabel))
+		.map((line) => tintGroupedToolLine(line, groupedLabel));
+	const content = rendered.find((line) => stripAnsi(line).trim().length > 0) ?? `${FG_DIM}${tool?.toolName ?? "tool"}${TRANSPARENT_RESET}`;
 	return clampLineWidth(trimAnsiLeft(content), width);
 }
 
 function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: string): string[] {
 	const lines = stripToolChrome(tool.render(Math.max(1, width)))
-		.map((line) => removeGroupedToolPrefix(line, groupedLabel));
-	return lines.length > 0 ? lines : [String(tool?.toolName ?? "tool")];
+		.map((line) => removeGroupedToolPrefix(line, groupedLabel))
+		.map((line) => tintGroupedToolLine(line, groupedLabel));
+	return lines.length > 0 ? lines : [`${FG_DIM}${String(tool?.toolName ?? "tool")}${TRANSPARENT_RESET}`];
 }
 
 function branchPrefix(index: number, total: number): string {
-	return index === total - 1 ? `${TOOL_RULE}└─${TRANSPARENT_RESET} ` : `${TOOL_RULE}├─${TRANSPARENT_RESET} `;
+	const branch = index === total - 1 ? "└─" : "├─";
+	return `  ${TOOL_RULE}${branch}${TRANSPARENT_RESET} `;
 }
 
 function branchContinuation(index: number, total: number): string {
-	return index === total - 1 ? "   " : `${TOOL_RULE}│${TRANSPARENT_RESET}  `;
+	return index === total - 1 ? "     " : `  ${TOOL_RULE}│${TRANSPARENT_RESET}  `;
 }
 
-function formatBranchedToolLines(lines: string[], index: number, total: number, width: number): string[] {
+function formatBranchedToolLines(lines: string[], index: number, total: number, width: number, status: ToolStatus): string[] {
 	const output: string[] = [];
 	const content = lines.filter((line) => isTerminalImageLine(line) || stripAnsi(line).trim().length > 0);
 	const safeContent = content.length > 0 ? content : [""];
+	const light = groupStatusLight(status);
 	for (let lineIndex = 0; lineIndex < safeContent.length; lineIndex++) {
 		const line = safeContent[lineIndex];
 		if (isTerminalImageLine(line)) {
 			output.push(line);
 			continue;
 		}
-		const prefix = lineIndex === 0 ? branchPrefix(index, total) : branchContinuation(index, total);
+		const prefix = lineIndex === 0 ? `${branchPrefix(index, total)}${light} ` : `${branchContinuation(index, total)}  `;
 		output.push(clampLineWidth(`${prefix}${trimAnsiLeft(line)}`, width));
 	}
 	return output;
 }
 
+const NON_GROUPABLE_TOOL_NAMES = new Set(["edit", "write", "apply_patch"]);
 const ACTIVE_TOOL_GROUPS = new Set<any>();
+
+function isGroupableTool(value: unknown): value is InstanceType<typeof ToolExecutionComponent> {
+	return value instanceof ToolExecutionComponent && !NON_GROUPABLE_TOOL_NAMES.has(getToolName(value));
+}
 
 class ToolGroupComponent extends Container {
 	private tools: any[] = [];
@@ -474,15 +494,16 @@ class ToolGroupComponent extends Container {
 		const label = getToolGroupLabel(this.tools);
 		const names = groupedName ? "" : formatToolNameList(this.tools);
 		const light = groupStatusLight(getToolGroupOverallStatus(this.tools));
-		const summary = `${light} ${label}: ${formatToolGroupCounts(this.tools)}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${toolOutputDetailHint(undefined as any, this.expanded, true)}`;
+		const summaryLabel = `${FG_DIM}${label}:${TRANSPARENT_RESET}`;
+		const summary = `  ${light} ${summaryLabel} ${formatToolGroupCounts(this.tools)}${names ? ` ${TRANSPARENT_RESET}• ${FG_DIM}${names}${TRANSPARENT_RESET}` : ""}${toolOutputDetailHint(undefined as any, this.expanded, true)}`;
 		const lines = [" ".repeat(safeWidth), clampLineWidth(summary, safeWidth)];
-		const childWidth = Math.max(1, safeWidth - 3);
+		const childWidth = Math.max(1, safeWidth - 8);
 
 		this.tools.forEach((tool, index) => {
 			const rawLines = this.expanded
 				? getExpandedToolGroupLines(tool, childWidth, groupedName ? label : undefined)
 				: [getCompactToolLine(tool, childWidth, groupedName ? label : undefined)];
-			lines.push(...formatBranchedToolLines(rawLines, index, this.tools.length, safeWidth));
+			lines.push(...formatBranchedToolLines(rawLines, index, this.tools.length, safeWidth, getToolStatusForGroup(tool)));
 		});
 
 		return lines;
@@ -496,19 +517,20 @@ function isToolGroupComponent(value: unknown): value is ToolGroupComponent {
 function isIgnorableToolSeparator(value: unknown): boolean {
 	if (value instanceof Spacer) return true;
 	if (value instanceof AssistantMessageComponent) {
-		try {
-			return trimRenderedBlankLines((value as any).render?.(80) ?? []).length === 0;
-		} catch {
-			return true;
-		}
+		const contentChildren = (value as any).contentContainer?.children;
+		return Array.isArray(contentChildren) && contentChildren.length === 0;
 	}
 	return false;
 }
 
 function findPreviousToolSibling(children: any[], startIndex: number): { child: any; index: number } | undefined {
+	let skippedSeparators = 0;
 	for (let index = startIndex; index >= 0; index--) {
 		const child = children[index];
-		if (isIgnorableToolSeparator(child)) continue;
+		if (isIgnorableToolSeparator(child) && skippedSeparators < 3) {
+			skippedSeparators++;
+			continue;
+		}
 		return { child, index };
 	}
 	return undefined;
@@ -534,7 +556,7 @@ function ungroupActiveToolGroups(): void {
 }
 
 function maybeGroupToolComponent(parent: any, component: any): void {
-	if (!toolGroupingEnabled() || !(component instanceof ToolExecutionComponent) || isToolGroupComponent(parent)) return;
+	if (!toolGroupingEnabled() || !isGroupableTool(component) || isToolGroupComponent(parent)) return;
 	const children = parent?.children;
 	if (!Array.isArray(children)) return;
 	const index = children.indexOf(component);
@@ -547,7 +569,7 @@ function maybeGroupToolComponent(parent: any, component: any): void {
 		previous.addTool(component);
 		return;
 	}
-	if (previous instanceof ToolExecutionComponent) {
+	if (isGroupableTool(previous)) {
 		const group = new ToolGroupComponent();
 		group.setExpanded(Boolean((previous as any).expanded));
 		group.addTool(previous);
