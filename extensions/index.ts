@@ -2163,57 +2163,15 @@ function buildPreviewText(lines: string[], expanded: boolean, theme: Theme, fall
 	if (lines.length === 0) return theme.fg("muted", "(no output)");
 	const maxLines = collapsedPreviewCount(expanded, fallbackCollapsed);
 	const shown = lines.slice(0, maxLines);
-	return buildPreviewTextFromShown(shown, lines.length, maxLines, expanded, theme);
-}
-
-function buildPreviewTextFromShown(shown: string[], totalLines: number, maxLines: number, expanded: boolean, theme: Theme): string {
-	if (totalLines === 0) return theme.fg("muted", "(no output)");
 	let text = shown.join("\n");
-	const remaining = totalLines - shown.length;
+	const remaining = lines.length - shown.length;
 	if (remaining > 0) {
 		text += `\n${theme.fg("muted", `... (${remaining} more lines${toolOutputDetailHint(theme, expanded, true)})`)}`;
 	}
-	if (expanded && totalLines > maxLines) {
+	if (expanded && lines.length > maxLines) {
 		text += `\n${theme.fg("warning", `(display capped at ${maxLines} lines${deepExpandHint()})`)}`;
 	}
 	return text;
-}
-
-function displayBlankLine(line: string): string {
-	return stripAnsi(line).length === 0 ? " " : line;
-}
-
-function splitReadOutput(text: string): string[] {
-	const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-	while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-	return lines;
-}
-
-function renderReadPreviewText(filePath: string, lines: string[], expanded: boolean, theme: Theme, ctx: any): string {
-	const maxLines = collapsedPreviewCount(expanded, previewLimit());
-	const shown = lines.slice(0, maxLines);
-	const fallbackLines = shown.map((line) => theme.fg("dim", line || " "));
-	const fallback = buildPreviewTextFromShown(fallbackLines, lines.length, maxLines, expanded, theme);
-	const language = lang(filePath);
-	const code = shown.join("\n");
-	if (!ctx.state || !language || !code || code.length > MAX_HL_CHARS) return fallback;
-
-	const key = `read:${DIFF_THEME}:${language}:${maxLines}:${lines.length}:${hashText(filePath)}:${hashText(code)}`;
-	if (ctx.state._readHighlightKey !== key) {
-		ctx.state._readHighlightKey = key;
-		ctx.state._readHighlightText = fallback;
-		hlBlock(code, language)
-			.then((highlighted) => {
-				if (ctx.state?._readHighlightKey !== key) return;
-				const highlightedLines = shown.map((line, index) => displayBlankLine(highlighted[index] ?? theme.fg("dim", line || " ")));
-				ctx.state._readHighlightText = buildPreviewTextFromShown(highlightedLines, lines.length, maxLines, expanded, theme);
-				safeInvalidate(ctx);
-			})
-			.catch(() => {
-				if (ctx.state?._readHighlightKey === key) ctx.state._readHighlightText = fallback;
-			});
-	}
-	return typeof ctx.state._readHighlightText === "string" ? ctx.state._readHighlightText : fallback;
 }
 
 // ===========================================================================
@@ -4969,19 +4927,16 @@ export default function (pi: ExtensionAPI) {
 			}
 			clearBlinkTimer(ctx);
 			setToolStatus(ctx, ctx.isError ? "error" : "success");
-			const mode = getMode(readSettings().readOutputMode, ["hidden", "summary", "preview"] as const, "preview");
-			if (mode === "hidden") return makeText(ctx.lastComponent, "");
 			if (getFirstImageBlock(result)) return renderReadImageResult(result, expanded, theme, ctx);
 			const details = result.details as ReadToolDetails | undefined;
 			const content = result.content.find((block: any) => block?.type === "text");
 			if (content?.type !== "text") return makeText(ctx.lastComponent, withBranch(theme.fg("error", "No text content"), theme));
-			const lines = splitReadOutput(content.text);
+			const lines = content.text.split("\n");
 			let text = theme.fg("muted", `${lines.length} lines loaded`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
-			if (mode === "summary") return makeText(ctx.lastComponent, withBranch(text, theme));
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
-			const preview = renderReadPreviewText(getStringArg(ctx.args, "path", "file_path") || "", lines, expanded, theme, ctx);
-			text += `\n${preview}`;
+			const shown = lines.slice(0, previewLimit());
+			text += `\n${buildPreviewText(shown.map((line) => theme.fg("dim", line || " ")), false, theme, previewLimit())}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
 	});

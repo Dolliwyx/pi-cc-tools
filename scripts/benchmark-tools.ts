@@ -159,6 +159,10 @@ class FakePi {
 		this.commands.set(name, command);
 	}
 
+	registerShortcut(_key: string, _shortcut: any): void {
+		// Benchmark harness only needs extension registration side effects.
+	}
+
 	on(name: string, handler: (...args: any[]) => any): void {
 		const handlers = this.events.get(name) ?? [];
 		handlers.push(handler);
