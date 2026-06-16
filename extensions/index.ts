@@ -111,6 +111,10 @@ interface SettingsFile {
 	 * "(thinking · ↓ 10 tokens · 2s)" trailer). Defaults to "muted".
 	 */
 	spinnerStatusColor?: string;
+	/** Gray level 0–255 for ├─ └─ │ when branch color mode is fixed. */
+	toolBranchRgbGray?: number;
+	/** "theme" (default): borderMuted → dim → muted when theme adaptive on. "fixed": use toolBranchRgbGray. */
+	toolBranchColorMode?: "theme" | "fixed";
 }
 
 let _settingsCache: { value: SettingsFile; timestamp: number } | null = null;
@@ -2699,7 +2703,41 @@ let FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_LNUM = "\x1b[38;2;100;100;100m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
 // Tool branch connectors (├─ └─ │). Fixed fallback; theme adaptive overrides below.
-let TOOL_RULE = "\x1b[38;2;116;116;116m";
+const DEFAULT_TOOL_BRANCH_GRAY = 124;
+
+function toolBranchRgbAnsi(gray: number): string {
+	const g = Math.max(0, Math.min(255, Math.round(gray)));
+	return `\x1b[38;2;${g};${g};${g}m`;
+}
+
+function getConfiguredToolBranchGray(): number {
+	const raw = readSettings().toolBranchRgbGray;
+	return typeof raw === "number" && Number.isFinite(raw) ? Math.max(0, Math.min(255, Math.round(raw))) : DEFAULT_TOOL_BRANCH_GRAY;
+}
+
+function toolBranchColorModeFixed(): boolean {
+	return readSettings().toolBranchColorMode === "fixed";
+}
+
+function applyToolBranchColor(theme?: any): void {
+	if (toolBranchColorModeFixed()) {
+		TOOL_RULE = toolBranchRgbAnsi(getConfiguredToolBranchGray());
+		return;
+	}
+	if (theme && themeAdaptiveEnabled()) {
+		const borderMuted = safeFgAnsi(theme, "borderMuted");
+		const muted = safeFgAnsi(theme, "muted");
+		const dim = safeFgAnsi(theme, "dim") ?? muted;
+		const branchFg = borderMuted ?? dim ?? muted;
+		if (branchFg) {
+			TOOL_RULE = branchFg;
+			return;
+		}
+	}
+	TOOL_RULE = toolBranchRgbAnsi(getConfiguredToolBranchGray());
+}
+
+let TOOL_RULE = toolBranchRgbAnsi(DEFAULT_TOOL_BRANCH_GRAY);
 let FG_SAFE_MUTED = "\x1b[38;2;139;148;158m";
 let FG_STRIPE = "\x1b[38;2;40;40;40m";
 
@@ -2791,7 +2829,7 @@ const _claudeStyleDefaults = {
 	BORDER_COLOR: "\x1b[38;5;238m",
 	WORKED_LINE_FG: "\x1b[38;2;140;140;140m",
 	CODE_BLOCK_LANG_FG: "\x1b[38;2;95;95;95m",
-	TOOL_RULE: "\x1b[38;2;116;116;116m",
+	TOOL_RULE: toolBranchRgbAnsi(DEFAULT_TOOL_BRANCH_GRAY),
 	FG_DIM: "\x1b[38;2;80;80;80m",
 	FG_LNUM: "\x1b[38;2;100;100;100m",
 	FG_RULE: "\x1b[38;2;50;50;50m",
@@ -2808,7 +2846,7 @@ function resetThemePalette(): void {
 	BORDER_COLOR = _claudeStyleDefaults.BORDER_COLOR;
 	WORKED_LINE_FG = _claudeStyleDefaults.WORKED_LINE_FG;
 	CODE_BLOCK_LANG_FG = _claudeStyleDefaults.CODE_BLOCK_LANG_FG;
-	TOOL_RULE = _claudeStyleDefaults.TOOL_RULE;
+	applyToolBranchColor();
 	TOOL_STATUS_SUCCESS = _claudeStyleDefaults.TOOL_STATUS_SUCCESS;
 	TOOL_STATUS_ERROR = _claudeStyleDefaults.TOOL_STATUS_ERROR;
 	TOOL_STATUS_PENDING = _claudeStyleDefaults.TOOL_STATUS_PENDING;
@@ -2825,7 +2863,10 @@ function resetThemePalette(): void {
 
 function applyThemePaletteIfNeeded(theme: any): void {
 	if (!theme) return;
-	if (!themeAdaptiveEnabled()) return;
+	if (!themeAdaptiveEnabled()) {
+		applyToolBranchColor(theme);
+		return;
+	}
 	if (_themePaletteCacheTheme === theme) return; // already applied for this theme instance
 	_themePaletteCacheTheme = theme;
 
@@ -2839,9 +2880,7 @@ function applyThemePaletteIfNeeded(theme: any): void {
 
 	const dim = safeFgAnsi(theme, "dim") ?? muted;
 
-	// Tool branch rule (├─ / └─ │ only): quieter than thinking — borderMuted, then dim, then muted.
-	const branchFg = borderMuted ?? dim ?? muted;
-	if (branchFg) TOOL_RULE = branchFg;
+	applyToolBranchColor(theme);
 
 	// Code-block language label: prefer `dim`, then border chrome, so it stays quieter than prose.
 	const langChrome = dim ?? borderMuted ?? safeFgAnsi(theme, "mdCode");
@@ -4913,7 +4952,7 @@ export default function (pi: ExtensionAPI) {
 	// /cc-tools command — control tool chrome, grouping, and detail level.
 	const TOOL_MODES = ["outlines", "transparent", "default"] as const;
 	const TOOL_BOOL_MODES = ["on", "off", "toggle", "status"] as const;
-	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "status"] as const;
+	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "branch", "status"] as const;
 	const booleanMode = (raw: string | undefined, current: boolean): boolean | "status" | undefined => {
 		const mode = raw || "toggle";
 		if (mode === "on") return true;
@@ -4924,10 +4963,14 @@ export default function (pi: ExtensionAPI) {
 	};
 	const notifyToolStatus = (ctx: any): void => {
 		if (!ctx.hasUI) return;
+		const branchMode = toolBranchColorModeFixed() ? "fixed" : "theme";
+		const branchGray = getConfiguredToolBranchGray();
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
+			`Branch color: ${branchMode} (gray ${branchGray} when fixed)`,
+			`  /cc-tools branch <0-255> | theme | fixed | reset`,
 		].join("\n"), "info");
 	};
 	pi.registerCommand("cc-tools", {
@@ -4944,11 +4987,19 @@ export default function (pi: ExtensionAPI) {
 						description:
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
+							: m === "branch" ? "├─ └─ │ gray (0-255), theme, fixed, or reset"
 							: m === "status" ? "Show tool UI settings"
 							: m === "outlines" ? "Horizontal rules around each tool (default)"
 							: m === "transparent" ? "No borders or backgrounds"
 							: "Pi built-in tool backgrounds",
 					}));
+			}
+			if (first === "branch") {
+				const second = parts[1] ?? "";
+				const opts = ["theme", "fixed", "reset", "status"];
+				return opts
+					.filter((o) => o.startsWith(second))
+					.map((o) => ({ value: `branch ${o}`, label: o, description: "Branch connector color" }));
 			}
 			if (first === "group" || first === "detail" || first === "extra") {
 				const second = parts[1] ?? "";
@@ -4985,6 +5036,59 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "branch") {
+				const arg = parts[1] ?? "status";
+				if (arg === "status" || !arg) {
+					notifyToolStatus(ctx);
+					return;
+				}
+				if (arg === "reset") {
+					writeSettingsKey("toolBranchRgbGray", undefined);
+					writeSettingsKey("toolBranchColorMode", undefined);
+					_themePaletteCacheTheme = null;
+					if (ctx.hasUI) applyToolBranchColor(ctx.ui.theme);
+					if (ctx.hasUI) {
+						ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
+						ctx.ui.notify(`Branch color → default (theme adaptive, gray ${DEFAULT_TOOL_BRANCH_GRAY} fallback)`, "info");
+					}
+					return;
+				}
+				if (arg === "theme") {
+					writeSettingsKey("toolBranchColorMode", "theme");
+					_themePaletteCacheTheme = null;
+					if (ctx.hasUI) applyToolBranchColor(ctx.ui.theme);
+					if (ctx.hasUI) {
+						ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
+						ctx.ui.notify("Branch color → follow pi theme (borderMuted → dim → muted)", "info");
+					}
+					return;
+				}
+				if (arg === "fixed") {
+					writeSettingsKey("toolBranchColorMode", "fixed");
+					_themePaletteCacheTheme = null;
+					if (ctx.hasUI) applyToolBranchColor(ctx.ui.theme);
+					if (ctx.hasUI) {
+						ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
+						ctx.ui.notify(`Branch color → fixed rgb(${getConfiguredToolBranchGray()})`, "info");
+					}
+					return;
+				}
+				const gray = Number.parseInt(arg, 10);
+				if (!Number.isFinite(gray) || gray < 0 || gray > 255) {
+					if (ctx.hasUI) ctx.ui.notify("Usage: /cc-tools branch <0-255> | theme | fixed | reset", "error");
+					return;
+				}
+				writeSettingsKey("toolBranchRgbGray", gray);
+				writeSettingsKey("toolBranchColorMode", "fixed");
+				_themePaletteCacheTheme = null;
+				if (ctx.hasUI) applyToolBranchColor(ctx.ui.theme);
+				if (ctx.hasUI) {
+					ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
+					ctx.ui.notify(`Branch color → fixed rgb(${gray})`, "info");
+				}
+				return;
+			}
+
 			if (sub === "detail" || sub === "extra") {
 				const next = booleanMode(parts[1], extraToolOutputExpanded);
 				if (next === undefined) {
@@ -5004,7 +5108,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!(TOOL_MODES as readonly string[]).includes(sub)) {
-				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools group toggle, or /cc-tools detail toggle.`, "error");
+				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools branch 124, or /cc-tools group toggle.`, "error");
 				return;
 			}
 			toolBackgroundOverride = sub as typeof toolBackgroundMode;
