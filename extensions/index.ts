@@ -244,9 +244,72 @@ function isCodeBoxChromeLine(line: string): boolean {
 	const plain = stripAnsi(line).trim();
 	if (!plain) return false;
 	if (/^[╭╮╰╯│·\s]+$/.test(plain) && /[╭╮╰╯│]/.test(plain)) return true;
-	if (/^╭·/.test(plain) && /╮$/.test(plain)) return true;
-	if (plain.startsWith("│") && plain.endsWith("│")) return true;
+	if (/^╭/.test(plain) && /╮$/.test(plain)) return true;
+	if (/^╰/.test(plain) && /╯$/.test(plain)) return true;
 	return false;
+}
+
+function isUserMessageChromeLine(line: string): boolean {
+	const plain = stripAnsi(line).trim();
+	if (/^╭/.test(plain) && /╮$/.test(plain)) return true;
+	if (/^╰/.test(plain) && /╯$/.test(plain)) return true;
+	return false;
+}
+
+function isBorderedContentLine(line: string): boolean {
+	const plain = stripAnsi(line).trim();
+	return plain.startsWith("│") && plain.endsWith("│") && plain.length > 2;
+}
+
+function extractBorderedInnerForCopy(line: string): string {
+	const plain = stripAnsi(line);
+	const start = plain.indexOf("│");
+	const end = plain.lastIndexOf("│");
+	if (start === -1 || end <= start) return stripAnsi(line).trim();
+	return plain.slice(start + 1, end).replace(/^\s+/, "").replace(/\s+$/, "");
+}
+
+function applyTerminalCopyZones(lines: string[]): string[] {
+	if (!Array.isArray(lines) || lines.length === 0) return lines;
+	const out: string[] = [];
+	let inZone = false;
+	for (const line of lines) {
+		if (isCopyExcludedChromeLine(line)) {
+			if (inZone) {
+				out[out.length - 1] += OSC133_ZONE_END;
+				inZone = false;
+			}
+			out.push(line);
+			continue;
+		}
+		const payload = copyPayloadForLine(line);
+		if (!payload) {
+			out.push(line);
+			continue;
+		}
+		if (!inZone) {
+			out.push(`${OSC133_ZONE_START}${line}`);
+			inZone = true;
+		} else {
+			out.push(line);
+		}
+	}
+	if (inZone && out.length > 0) {
+		out[out.length - 1] += OSC133_ZONE_END + OSC133_ZONE_FINAL;
+	}
+	return out;
+}
+
+function isCopyExcludedChromeLine(line: string): boolean {
+	return isCodeBoxChromeLine(line) || isUserMessageChromeLine(line);
+}
+
+function copyPayloadForLine(line: string): string | undefined {
+	if (isCopyExcludedChromeLine(line)) return undefined;
+	if (isBorderedContentLine(line)) return extractBorderedInnerForCopy(line);
+	const plain = stripAnsi(line).trim();
+	if (!plain) return undefined;
+	return plain;
 }
 
 function roundedCodeBlockTop(width: number, language: string): string {
@@ -849,6 +912,7 @@ function safeInvalidate(ctx: any): void {
 }
 
 const ASSISTANT_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message");
+const ASSISTANT_RENDER_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message-render");
 const TOOL_EXECUTION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-execution");
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -898,12 +962,18 @@ function formatThoughtDuration(ms: number): string {
 	return formatWorkedDuration(safeMs);
 }
 
+const THINKING_ITALIC = "\x1b[3m";
+
+function thinkingSummaryStyledText(body: string): string {
+	return `${WORKED_LINE_FG}${THINKING_ITALIC}✻ ${body}${RESET}`;
+}
+
 function thinkingActiveSummaryText(): string {
-	return ` ${WORKED_LINE_FG}✻${RESET} Thinking…`;
+	return thinkingSummaryStyledText("Thinking…");
 }
 
 function thoughtDurationSummaryText(ms: number): string {
-	return ` ${WORKED_LINE_FG}✻${RESET} Thought for ${formatThoughtDuration(ms)}`;
+	return thinkingSummaryStyledText(`Thought for ${formatThoughtDuration(ms)}`);
 }
 
 function hiddenThinkingSummaryForMessage(message: any): string {
@@ -1578,9 +1648,8 @@ function patchUserMessageRender(): void {
 			...lines.map((line: string) => borderedUserMessageLine(line, borderWidth)),
 			roundedUserBorder(borderWidth, false),
 		];
-		rendered[0] = OSC133_ZONE_START + rendered[0];
-		rendered[rendered.length - 1] += OSC133_ZONE_END + OSC133_ZONE_FINAL;
-		return rendered.map((line) => clampLineWidth(line, borderWidth));
+		const clamped = rendered.map((line) => clampLineWidth(line, borderWidth));
+		return applyTerminalCopyZones(clamped);
 	};
 	proto[USER_MESSAGE_PATCH_FLAG] = true;
 }
@@ -1588,6 +1657,16 @@ function patchUserMessageRender(): void {
 function patchAssistantMessages(): void {
 	const proto = AssistantMessageComponent.prototype as any;
 	if (proto[ASSISTANT_PATCH_FLAG]) return;
+	const originalRender = proto.render;
+	if (typeof originalRender === "function" && !proto[ASSISTANT_RENDER_PATCH_FLAG]) {
+		proto.render = function patchedAssistantMessageRender(width: number) {
+			const lines = originalRender.call(this, width);
+			if (!Array.isArray(lines) || lines.length === 0) return lines;
+			if ((this as any).hasToolCalls) return lines;
+			return applyTerminalCopyZones(lines);
+		};
+		proto[ASSISTANT_RENDER_PATCH_FLAG] = true;
+	}
 	const originalUpdateContent = proto.updateContent;
 	proto.updateContent = function patchedUpdateContent(message: any) {
 		if (!(this as any)[WORKED_START_KEY]) {
@@ -1597,7 +1676,7 @@ function patchAssistantMessages(): void {
 			return originalUpdateContent.call(this, message);
 		}
 		if ((this as any).hideThinkingBlock && messageHasThinkingContent(message)) {
-			(this as any).hiddenThinkingLabel = stripAnsi(thinkingActiveSummaryText()).trim();
+			(this as any).hiddenThinkingLabel = thinkingActiveSummaryText();
 		}
 		// Call original to build all children (text, thinking, spacers, errors)
 		originalUpdateContent.call(this, message);
@@ -1607,7 +1686,10 @@ function patchAssistantMessages(): void {
 		if ((this as any).hideThinkingBlock && messageHasThinkingContent(message)) {
 			const summary = hiddenThinkingSummaryForMessage(message);
 			for (const child of container.children) {
-				if (isHiddenThinkingPlaceholderText(child)) child.setText(summary);
+				if (isHiddenThinkingPlaceholderText(child)) {
+					child.setText(summary);
+					(child as any).paddingX = 0;
+				}
 			}
 		}
 		const mdTheme = (this as any).markdownTheme;
