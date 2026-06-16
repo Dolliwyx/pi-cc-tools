@@ -2690,6 +2690,8 @@ function themeAdaptiveEnabled(): boolean {
 }
 
 let DIFF_THEME: BundledTheme = (process.env.DIFF_THEME as BundledTheme | undefined) ?? "github-dark";
+/** True when the active pi theme has a light panel background (edit/write diff chrome). */
+let _diffOnLightBg = false;
 let codeToAnsiLoader: Promise<any> | null = null;
 
 const SPLIT_MIN_WIDTH = 150;
@@ -2867,8 +2869,35 @@ function mixBg(
 // pi-tool-display tint targets for diff palette derivation
 const ADDITION_TINT_TARGET = { r: 84, g: 190, b: 118 };
 const DELETION_TINT_TARGET = { r: 232, g: 95, b: 122 };
-// Fallback base that matches most dark themes (NOT black)
-const FALLBACK_BASE_BG = { r: 32, g: 35, b: 42 };
+// Fallback panel bases when theme bg vars are unavailable
+const FALLBACK_BASE_BG_DARK = { r: 32, g: 35, b: 42 };
+const FALLBACK_BASE_BG_LIGHT = { r: 232, g: 233, b: 236 };
+
+function isLightThemeBackground(theme: any): boolean {
+	const panel =
+		themeBgRgb(theme, "toolSuccessBg") ||
+		themeBgRgb(theme, "userMessageBg") ||
+		themeBgRgb(theme, "selectedBg");
+	if (panel) {
+		const lum = 0.2126 * panel.r + 0.7152 * panel.g + 0.0722 * panel.b;
+		return lum > 165;
+	}
+	const fg = themeFgRgb(theme, "text") || themeFgRgb(theme, "fg");
+	if (fg) {
+		const lum = 0.2126 * fg.r + 0.7152 * fg.g + 0.0722 * fg.b;
+		return lum < 95;
+	}
+	return false;
+}
+
+function syncDiffShikiTheme(theme: any): void {
+	if (process.env.DIFF_THEME) return;
+	const config = loadDiffConfig();
+	if (config.diffTheme) return;
+	_diffOnLightBg = isLightThemeBackground(theme);
+	DIFF_THEME = (_diffOnLightBg ? "github-light" : "github-dark") as BundledTheme;
+	clearHighlightCache();
+}
 const UNIVERSAL_DIFF_ADD_FG = { r: 110, g: 210, b: 130 };
 const UNIVERSAL_DIFF_DEL_FG = { r: 225, g: 110, b: 110 };
 
@@ -2897,9 +2926,14 @@ function autoDeriveBgFromTheme(theme: any): void {
 	// instead of forcing a hardcoded dark hue. Falls back to the universal
 	// dark palette when the theme is unavailable or themeAdaptive=false.
 	const useTheme = themeAdaptiveEnabled() && theme;
+	const onLight = useTheme && isLightThemeBackground(theme);
+	_diffOnLightBg = !!onLight;
 	const addFgRgb = (useTheme && themeFgRgb(theme, "toolDiffAdded")) || UNIVERSAL_DIFF_ADD_FG;
 	const delFgRgb = (useTheme && themeFgRgb(theme, "toolDiffRemoved")) || UNIVERSAL_DIFF_DEL_FG;
-	const base = (useTheme && themeBgRgb(theme, "toolSuccessBg")) || FALLBACK_BASE_BG;
+	const base =
+		(useTheme && themeBgRgb(theme, "toolSuccessBg")) ||
+		(useTheme && themeBgRgb(theme, "userMessageBg")) ||
+		(onLight ? FALLBACK_BASE_BG_LIGHT : FALLBACK_BASE_BG_DARK);
 
 	const addTint = mixRgb(addFgRgb, ADDITION_TINT_TARGET, 0.35);
 	const delTint = mixRgb(delFgRgb, DELETION_TINT_TARGET, 0.65);
@@ -3009,7 +3043,10 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	if (!hasExplicitBgConfig) {
 		autoDeriveBgFromTheme(theme);
 		autoDerivePending = false;
+	} else if (themeAdaptiveEnabled()) {
+		_diffOnLightBg = isLightThemeBackground(theme);
 	}
+	syncDiffShikiTheme(theme);
 }
 
 function applyDiffPalette(): void {
@@ -3187,6 +3224,7 @@ function ansiState(text: string): string {
 }
 
 function normalizeShikiContrast(ansi: string): string {
+	const darkFgThreshold = _diffOnLightBg ? 140 : 72;
 	return ansi.replace(/\x1b\[([0-9;]*)m/g, (seq, params: string) => {
 		if (params === "30" || params === "90" || params === "38;5;0" || params === "38;5;8") return FG_SAFE_MUTED;
 		if (!params.startsWith("38;2;")) return seq;
@@ -3194,7 +3232,10 @@ function normalizeShikiContrast(ansi: string): string {
 		if (parts.length !== 5 || parts.some((n) => !Number.isFinite(n))) return seq;
 		const [, , r, g, b] = parts;
 		const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-		return luminance < 72 ? FG_SAFE_MUTED : seq;
+		if (_diffOnLightBg) {
+			return luminance < darkFgThreshold ? seq : FG_SAFE_MUTED;
+		}
+		return luminance < darkFgThreshold ? FG_SAFE_MUTED : seq;
 	});
 }
 
