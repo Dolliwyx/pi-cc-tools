@@ -111,9 +111,9 @@ interface SettingsFile {
 	 * "(thinking · ↓ 10 tokens · 2s)" trailer). Defaults to "muted".
 	 */
 	spinnerStatusColor?: string;
-	/** Gray level 0–255 for ├─ └─ │ when branch color mode is fixed (default 72). */
+	/** Gray level 0–255 for ├─ └─ │ when branch color mode is `fixed`. */
 	toolBranchRgbGray?: number;
-	/** "fixed" (default): use toolBranchRgbGray. "theme": borderMuted → dim → muted when theme adaptive on. */
+	/** `theme` (default): dim → muted → thinkingText — matches thought/gray prose. `fixed`: toolBranchRgbGray. */
 	toolBranchColorMode?: "theme" | "fixed";
 }
 
@@ -2285,11 +2285,9 @@ function clearBlinkTimer(ctx: any): void {
 	_scheduleGlobalBlinkTimer();
 }
 
-function pendingToolChromeColor(theme: Theme): "borderMuted" | "muted" {
-	if (isLightThemeBackground(theme)) {
-		return "borderMuted";
-	}
-	return "muted";
+function pendingToolChromeColor(theme: Theme): "dim" | "muted" | "thinkingText" {
+	if (!themeAdaptiveEnabled()) return "muted";
+	return "dim";
 }
 
 function blinkDot(ctx: any, theme: Theme): string {
@@ -2751,7 +2749,7 @@ function getConfiguredToolBranchGray(): number {
 }
 
 function toolBranchColorModeFixed(): boolean {
-	return readSettings().toolBranchColorMode !== "theme";
+	return readSettings().toolBranchColorMode === "fixed";
 }
 
 function toolBranchRenderCacheKey(): string {
@@ -2774,10 +2772,10 @@ function currentToolBranchAnsi(theme?: any): string {
 		return toolBranchRgbAnsi(getConfiguredToolBranchGray());
 	}
 	if (t && themeAdaptiveEnabled()) {
-		const borderMuted = safeFgAnsi(t, "borderMuted");
 		const muted = safeFgAnsi(t, "muted");
 		const dim = safeFgAnsi(t, "dim") ?? muted;
-		const branchFg = borderMuted ?? dim ?? muted;
+		const thinking = safeFgAnsi(t, "thinkingText");
+		const branchFg = dim ?? muted ?? thinking;
 		if (branchFg) return branchFg;
 	}
 	return toolBranchRgbAnsi(getConfiguredToolBranchGray());
@@ -3034,14 +3032,8 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	// Grouped-tool status counts follow the same semantic theme colors as regular tool dots.
 	TOOL_STATUS_SUCCESS = safeFgAnsi(theme, "success") ?? TOOL_STATUS_SUCCESS;
 	TOOL_STATUS_ERROR = safeFgAnsi(theme, "error") ?? TOOL_STATUS_ERROR;
-	const pendingChrome = dim ?? muted ?? TOOL_STATUS_PENDING;
-	TOOL_STATUS_PENDING = pendingChrome;
-
-	// Light themes: pending ○ reads too heavy when dim/muted track body fg — soften chrome only.
-	if (isLightThemeBackground(theme)) {
-		const softPending = safeFgAnsi(theme, "borderMuted") ?? safeFgAnsi(theme, "gray") ?? pendingChrome;
-		TOOL_STATUS_PENDING = softPending;
-	}
+	const thinking = safeFgAnsi(theme, "thinkingText");
+	TOOL_STATUS_PENDING = dim ?? muted ?? thinking ?? TOOL_STATUS_PENDING;
 
 	// Diff support text colors. These are user-overridable via diffColors.* so
 	// we only touch the ones not explicitly set.
@@ -5221,16 +5213,16 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (arg === "reset") {
-					writeSettingsKey("toolBranchRgbGray", DEFAULT_TOOL_BRANCH_GRAY);
-					writeSettingsKey("toolBranchColorMode", "fixed");
+					writeSettingsKey("toolBranchRgbGray", undefined);
+					writeSettingsKey("toolBranchColorMode", undefined);
 					if (ctx.hasUI) refreshAllToolBranchVisuals(ctx);
-					if (ctx.hasUI) ctx.ui.notify(`Branch color → default fixed rgb(${DEFAULT_TOOL_BRANCH_GRAY})`, "info");
+					if (ctx.hasUI) ctx.ui.notify("Branch color → follow theme (dim / muted / thinking)", "info");
 					return;
 				}
 				if (arg === "theme") {
 					writeSettingsKey("toolBranchColorMode", "theme");
 					if (ctx.hasUI) refreshAllToolBranchVisuals(ctx);
-					if (ctx.hasUI) ctx.ui.notify("Branch color → follow pi theme (borderMuted → dim → muted)", "info");
+					if (ctx.hasUI) ctx.ui.notify("Branch color → follow pi theme (dim → muted → thinking)", "info");
 					return;
 				}
 				if (arg === "fixed") {
