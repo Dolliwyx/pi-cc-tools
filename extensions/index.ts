@@ -111,9 +111,9 @@ interface SettingsFile {
 	 * "(thinking · ↓ 10 tokens · 2s)" trailer). Defaults to "muted".
 	 */
 	spinnerStatusColor?: string;
-	/** Gray level 0–255 for ├─ └─ │ when branch color mode is fixed. */
+	/** Gray level 0–255 for ├─ └─ │ when branch color mode is fixed (default 72). */
 	toolBranchRgbGray?: number;
-	/** "theme" (default): borderMuted → dim → muted when theme adaptive on. "fixed": use toolBranchRgbGray. */
+	/** "fixed" (default): use toolBranchRgbGray. "theme": borderMuted → dim → muted when theme adaptive on. */
 	toolBranchColorMode?: "theme" | "fixed";
 }
 
@@ -605,13 +605,15 @@ function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: stri
 	return lines.length > 0 ? lines : [`${FG_DIM}${String(tool?.toolName ?? "tool")}${TRANSPARENT_RESET}`];
 }
 
-function branchPrefix(index: number, total: number): string {
+function branchPrefix(index: number, total: number, theme?: Theme): string {
 	const branch = index === total - 1 ? "└─" : "├─";
-	return ` ${TOOL_RULE}${branch}${TRANSPARENT_RESET} `;
+	const rule = currentToolBranchAnsi(theme);
+	return ` ${rule}${branch}${TRANSPARENT_RESET} `;
 }
 
-function branchContinuation(index: number, total: number): string {
-	return index === total - 1 ? "    " : ` ${TOOL_RULE}│${TRANSPARENT_RESET}  `;
+function branchContinuation(index: number, total: number, theme?: Theme): string {
+	const rule = currentToolBranchAnsi(theme);
+	return index === total - 1 ? "    " : ` ${rule}│${TRANSPARENT_RESET}  `;
 }
 
 function formatBranchedToolLines(lines: string[], index: number, total: number, width: number, status: ToolStatus): string[] {
@@ -2150,32 +2152,34 @@ function toolStatusDot(ctx: any, theme: Theme): string {
 // Branch connector — visual tree from header to output
 // ---------------------------------------------------------------------------
 
-function branchIndent(text: string, continued = false): string {
-	const prefix = continued ? `${TOOL_RULE}│${TRANSPARENT_RESET}  ` : "   ";
+function branchIndent(text: string, continued = false, theme?: Theme): string {
+	const rule = currentToolBranchAnsi(theme);
+	const prefix = continued ? `${rule}│${TRANSPARENT_RESET}  ` : "   ";
 	return `${prefix}${WRAP_MARK}${text}`;
 }
 
-function branchLead(text: string, continued = false): string {
-	return `${TOOL_RULE}${continued ? "├─" : "└─"}${TRANSPARENT_RESET} ${WRAP_MARK}${text}`;
+function branchLead(text: string, continued = false, theme?: Theme): string {
+	const rule = currentToolBranchAnsi(theme);
+	return `${rule}${continued ? "├─" : "└─"}${TRANSPARENT_RESET} ${WRAP_MARK}${text}`;
 }
 
-function withBranch(content: string, _theme: Theme, _isError = false, continued = false): string {
+function withBranch(content: string, theme: Theme, _isError = false, continued = false): string {
 	if (!content || !content.trim()) return "";
 	const lines = content.split("\n");
 	const first = lines[0] ?? "";
-	if (lines.length === 1) return branchLead(first, continued);
-	const rest = lines.slice(1).map((line) => branchIndent(line, continued));
-	return `${branchLead(first, continued)}\n${rest.join("\n")}`;
+	if (lines.length === 1) return branchLead(first, continued, theme);
+	const rest = lines.slice(1).map((line) => branchIndent(line, continued, theme));
+	return `${branchLead(first, continued, theme)}\n${rest.join("\n")}`;
 }
 
 function withFinalBranchBlock(content: string, theme: Theme, isError = false): string {
 	if (!content || !content.trim()) return "";
 	const lines = content.split("\n");
 	const first = lines[0] ?? "";
-	if (lines.length === 1) return branchLead(first, false);
-	const middle = lines.slice(1, -1).map((line) => branchIndent(line, true));
+	if (lines.length === 1) return branchLead(first, false, theme);
+	const middle = lines.slice(1, -1).map((line) => branchIndent(line, true, theme));
 	const last = lines[lines.length - 1] ?? "";
-	return [branchLead(first, true), ...middle, branchLead(last, false)].join("\n");
+	return [branchLead(first, true, theme), ...middle, branchLead(last, false, theme)].join("\n");
 }
 
 function indentBranchBlock(block: string): string {
@@ -2371,7 +2375,7 @@ function markedContinuationPrefix(prefix: string): string {
 	const plain = stripAnsi(prefix);
 	const branchMatch = /^(\s*)(?:│  |├─ |└─ )/.exec(plain);
 	if (branchMatch) {
-		return `${branchMatch[1]}${TOOL_RULE}│${TRANSPARENT_RESET}  `;
+		return `${branchMatch[1]}${currentToolBranchAnsi()}│${TRANSPARENT_RESET}  `;
 	}
 	return " ".repeat(visibleWidth(prefix));
 }
@@ -2412,7 +2416,14 @@ class ToolText extends Text {
 	}
 
 	render(width: number): string[] {
-		if (this.toolCachedLines && this.toolCachedValue === this.value && this.toolCachedWidth === width) return this.toolCachedLines;
+		const branchKey = toolBranchRenderCacheKey();
+		if (
+			this.toolCachedLines
+			&& this.toolCachedValue === this.value
+			&& this.toolCachedWidth === width
+			&& (this as any)._toolBranchCacheKey === branchKey
+			&& (this as any)._toolBranchCacheEpoch === _toolBranchVisualEpoch
+		) return this.toolCachedLines;
 		if (!this.value || this.value.trim() === "") {
 			this.toolCachedValue = this.value;
 			this.toolCachedWidth = width;
@@ -2425,6 +2436,8 @@ class ToolText extends Text {
 		this.toolCachedValue = this.value;
 		this.toolCachedWidth = width;
 		this.toolCachedLines = rendered;
+		(this as any)._toolBranchCacheKey = branchKey;
+		(this as any)._toolBranchCacheEpoch = _toolBranchVisualEpoch;
 		return rendered;
 	}
 }
@@ -2715,7 +2728,7 @@ let FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_LNUM = "\x1b[38;2;100;100;100m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
 // Tool branch connectors (├─ └─ │). Fixed fallback; theme adaptive overrides below.
-const DEFAULT_TOOL_BRANCH_GRAY = 136;
+const DEFAULT_TOOL_BRANCH_GRAY = 72;
 
 function toolBranchRgbAnsi(gray: number): string {
 	const g = Math.max(0, Math.min(255, Math.round(gray)));
@@ -2728,7 +2741,7 @@ function getConfiguredToolBranchGray(): number {
 }
 
 function toolBranchColorModeFixed(): boolean {
-	return readSettings().toolBranchColorMode === "fixed";
+	return readSettings().toolBranchColorMode !== "theme";
 }
 
 function toolBranchRenderCacheKey(): string {
@@ -2742,19 +2755,28 @@ function bumpToolBranchVisualEpoch(): void {
 	_toolBranchVisualEpoch++;
 }
 
-function applyToolBranchColor(theme?: any): void {
-	const prev = TOOL_RULE;
+/** Resolve ├─ └─ │ color from settings + theme on every use (not a stale global). */
+let _toolBranchThemeHint: any;
+
+function currentToolBranchAnsi(theme?: any): string {
+	const t = theme ?? _toolBranchThemeHint;
 	if (toolBranchColorModeFixed()) {
-		TOOL_RULE = toolBranchRgbAnsi(getConfiguredToolBranchGray());
-	} else if (theme && themeAdaptiveEnabled()) {
-		const borderMuted = safeFgAnsi(theme, "borderMuted");
-		const muted = safeFgAnsi(theme, "muted");
-		const dim = safeFgAnsi(theme, "dim") ?? muted;
-		const branchFg = borderMuted ?? dim ?? muted;
-		TOOL_RULE = branchFg ?? toolBranchRgbAnsi(getConfiguredToolBranchGray());
-	} else {
-		TOOL_RULE = toolBranchRgbAnsi(getConfiguredToolBranchGray());
+		return toolBranchRgbAnsi(getConfiguredToolBranchGray());
 	}
+	if (t && themeAdaptiveEnabled()) {
+		const borderMuted = safeFgAnsi(t, "borderMuted");
+		const muted = safeFgAnsi(t, "muted");
+		const dim = safeFgAnsi(t, "dim") ?? muted;
+		const branchFg = borderMuted ?? dim ?? muted;
+		if (branchFg) return branchFg;
+	}
+	return toolBranchRgbAnsi(getConfiguredToolBranchGray());
+}
+
+function applyToolBranchColor(theme?: any): void {
+	if (theme) _toolBranchThemeHint = theme;
+	const prev = TOOL_RULE;
+	TOOL_RULE = currentToolBranchAnsi(theme);
 	if (TOOL_RULE !== prev) bumpToolBranchVisualEpoch();
 }
 
@@ -2804,7 +2826,7 @@ function refreshAllToolBranchVisuals(ctx: any): void {
 	_settingsCache = null;
 	_themePaletteCacheTheme = null;
 	applyToolBranchColor(ctx?.ui?.theme);
-	bumpToolBranchVisualEpoch();
+	bumpToolBranchVisualEpoch(); // always bust ToolText + container caches after /cc-tools branch
 	// Tool rows recompute branch markup on next render (liveBranchDisplay + cache bust).
 	if (ctx?.hasUI) {
 		try {
@@ -2945,7 +2967,10 @@ function applyThemePaletteIfNeeded(theme: any): void {
 		applyToolBranchColor(theme);
 		return;
 	}
-	if (_themePaletteCacheTheme === theme) return; // already applied for this theme instance
+	if (_themePaletteCacheTheme === theme) {
+		applyToolBranchColor(theme);
+		return;
+	}
 	_themePaletteCacheTheme = theme;
 
 	// Borders (top/bottom outlines, user-message frame, branch rule).
@@ -5066,7 +5091,7 @@ export default function (pi: ExtensionAPI) {
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
-			`Branch color: ${branchMode} (gray ${branchGray} when fixed)`,
+			`Branch color: ${branchMode} (gray ${branchGray}${branchMode === "fixed" ? " default" : ""})`,
 			`  /cc-tools branch <0-255> | theme | fixed | reset`,
 		].join("\n"), "info");
 	};
@@ -5140,10 +5165,10 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (arg === "reset") {
-					writeSettingsKey("toolBranchRgbGray", undefined);
-					writeSettingsKey("toolBranchColorMode", undefined);
+					writeSettingsKey("toolBranchRgbGray", DEFAULT_TOOL_BRANCH_GRAY);
+					writeSettingsKey("toolBranchColorMode", "fixed");
 					if (ctx.hasUI) refreshAllToolBranchVisuals(ctx);
-					if (ctx.hasUI) ctx.ui.notify(`Branch color → default (theme adaptive, gray ${DEFAULT_TOOL_BRANCH_GRAY} fallback)`, "info");
+					if (ctx.hasUI) ctx.ui.notify(`Branch color → default fixed rgb(${DEFAULT_TOOL_BRANCH_GRAY})`, "info");
 					return;
 				}
 				if (arg === "theme") {
@@ -5189,7 +5214,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!(TOOL_MODES as readonly string[]).includes(sub)) {
-				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools branch 136, or /cc-tools group toggle.`, "error");
+				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools branch 72, or /cc-tools group toggle.`, "error");
 				return;
 			}
 			toolBackgroundOverride = sub as typeof toolBackgroundMode;
