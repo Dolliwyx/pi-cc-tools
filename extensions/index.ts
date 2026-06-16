@@ -2698,7 +2698,8 @@ let FG_DEL = "\x1b[38;2;200;100;100m";
 let FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_LNUM = "\x1b[38;2;100;100;100m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
-let TOOL_RULE = "\x1b[38;2;153;153;153m";
+// Tool branch connectors (├─ └─ │). Fixed fallback; theme adaptive overrides below.
+let TOOL_RULE = "\x1b[38;2;116;116;116m";
 let FG_SAFE_MUTED = "\x1b[38;2;139;148;158m";
 let FG_STRIPE = "\x1b[38;2;40;40;40m";
 
@@ -2790,7 +2791,7 @@ const _claudeStyleDefaults = {
 	BORDER_COLOR: "\x1b[38;5;238m",
 	WORKED_LINE_FG: "\x1b[38;2;140;140;140m",
 	CODE_BLOCK_LANG_FG: "\x1b[38;2;95;95;95m",
-	TOOL_RULE: "\x1b[38;2;153;153;153m",
+	TOOL_RULE: "\x1b[38;2;116;116;116m",
 	FG_DIM: "\x1b[38;2;80;80;80m",
 	FG_LNUM: "\x1b[38;2;100;100;100m",
 	FG_RULE: "\x1b[38;2;50;50;50m",
@@ -2836,13 +2837,15 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	const muted = safeFgAnsi(theme, "muted");
 	if (muted) WORKED_LINE_FG = muted;
 
-	// Tool branch rule (├─ / └─ connectors). Use `dim` if present, else `muted`.
 	const dim = safeFgAnsi(theme, "dim") ?? muted;
+
+	// Tool branch rule (├─ / └─ │ only): quieter than thinking — borderMuted, then dim, then muted.
+	const branchFg = borderMuted ?? dim ?? muted;
+	if (branchFg) TOOL_RULE = branchFg;
 
 	// Code-block language label: prefer `dim`, then border chrome, so it stays quieter than prose.
 	const langChrome = dim ?? borderMuted ?? safeFgAnsi(theme, "mdCode");
 	if (langChrome) CODE_BLOCK_LANG_FG = langChrome;
-	if (dim) TOOL_RULE = dim;
 
 	// Grouped-tool status counts follow the same semantic theme colors as regular tool dots.
 	TOOL_STATUS_SUCCESS = safeFgAnsi(theme, "success") ?? TOOL_STATUS_SUCCESS;
