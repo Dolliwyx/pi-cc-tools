@@ -796,7 +796,13 @@ function patchGlobalToolBorders(): void {
 	proto.render = function patchedContainerRender(width: number): string[] {
 		if (isToolExecutionLike(this)) {
 			const cached = (this as any)[TOOL_RENDER_CACHE];
-			if (cached?.width === width && cached?.mode === toolBackgroundMode) {
+			const branchKey = toolBranchRenderCacheKey();
+			if (
+				cached?.width === width
+				&& cached?.mode === toolBackgroundMode
+				&& cached?.branchKey === branchKey
+				&& cached?.branchEpoch === _toolBranchVisualEpoch
+			) {
 				return cached.lines;
 			}
 		}
@@ -804,8 +810,9 @@ function patchGlobalToolBorders(): void {
 		const rendered = originalRender.call(this, width);
 		if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
 		if (!isToolExecutionLike(this)) return rendered;
+		const branchCache = { branchKey: toolBranchRenderCacheKey(), branchEpoch: _toolBranchVisualEpoch };
 		if (toolBackgroundMode === "default") {
-			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered };
+			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered, ...branchCache };
 			return rendered;
 		}
 
@@ -817,7 +824,7 @@ function patchGlobalToolBorders(): void {
 
 		const { textLines, imageLines } = splitRenderedImageBlock(rendered.slice(start, end + 1));
 		if (imageLines.length > 0) {
-			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered };
+			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered, ...branchCache };
 			return rendered;
 		}
 		const indentTool = shouldIndentToolExecution(this);
@@ -836,7 +843,7 @@ function patchGlobalToolBorders(): void {
 			result = [spacerLine, ...core, ...imageLines];
 		}
 
-		(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: result };
+		(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: result, ...branchCache };
 		return result;
 	};
 
@@ -2719,22 +2726,31 @@ function toolBranchColorModeFixed(): boolean {
 	return readSettings().toolBranchColorMode === "fixed";
 }
 
+function toolBranchRenderCacheKey(): string {
+	if (toolBranchColorModeFixed()) return `fixed:${getConfiguredToolBranchGray()}`;
+	return `theme:${stripAnsi(TOOL_RULE)}`;
+}
+
+let _toolBranchVisualEpoch = 0;
+
+function bumpToolBranchVisualEpoch(): void {
+	_toolBranchVisualEpoch++;
+}
+
 function applyToolBranchColor(theme?: any): void {
+	const prev = TOOL_RULE;
 	if (toolBranchColorModeFixed()) {
 		TOOL_RULE = toolBranchRgbAnsi(getConfiguredToolBranchGray());
-		return;
-	}
-	if (theme && themeAdaptiveEnabled()) {
+	} else if (theme && themeAdaptiveEnabled()) {
 		const borderMuted = safeFgAnsi(theme, "borderMuted");
 		const muted = safeFgAnsi(theme, "muted");
 		const dim = safeFgAnsi(theme, "dim") ?? muted;
 		const branchFg = borderMuted ?? dim ?? muted;
-		if (branchFg) {
-			TOOL_RULE = branchFg;
-			return;
-		}
+		TOOL_RULE = branchFg ?? toolBranchRgbAnsi(getConfiguredToolBranchGray());
+	} else {
+		TOOL_RULE = toolBranchRgbAnsi(getConfiguredToolBranchGray());
 	}
-	TOOL_RULE = toolBranchRgbAnsi(getConfiguredToolBranchGray());
+	if (TOOL_RULE !== prev) bumpToolBranchVisualEpoch();
 }
 
 let TOOL_RULE = toolBranchRgbAnsi(DEFAULT_TOOL_BRANCH_GRAY);
