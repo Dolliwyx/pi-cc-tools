@@ -965,7 +965,7 @@ function formatThoughtDuration(ms: number): string {
 const THINKING_ITALIC = "\x1b[3m";
 
 function thinkingSummaryStyledText(body: string): string {
-	return `${WORKED_LINE_FG}${THINKING_ITALIC}✻ ${body}${RESET}`;
+	return ` ${WORKED_LINE_FG}${THINKING_ITALIC}✻ ${body}${RESET}`;
 }
 
 function thinkingActiveSummaryText(): string {
@@ -1499,6 +1499,7 @@ class ThinkingParagraph {
 		}
 		const lines = sanitizeRenderedTextBlockLines(this.md.render(safeWidth - PREFIX_W), safeWidth - PREFIX_W);
 		let symbolPlaced = false;
+		// Match DottedParagraph / tool row glyph column: " <glyph> <text>"
 		const rendered = lines.map((line: string) => {
 			if (!symbolPlaced && stripAnsi(line).trim()) {
 				symbolPlaced = true;
