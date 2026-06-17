@@ -50,7 +50,7 @@ const TRANSPARENT_RESET = `${RESET}${TRANSPARENT_BG}`;
 
 // Border / branch rule colors. Defaults match the previous hardcoded values
 // so behavior is identical when the theme is unavailable or themeAdaptive=false.
-// `applyThemePaletteIfNeeded(theme)` re-derives these from `theme.fg("borderMuted"|"muted")`.
+// `applyThemePaletteIfNeeded(theme)` re-derives chrome from dim → muted → borderMuted.
 let BORDER_COLOR = "\x1b[38;5;238m";
 // Fenced-code language tag — dimmer than body `muted` so it reads as chrome, not prose.
 let CODE_BLOCK_LANG_FG = "\x1b[38;2;95;95;95m";
@@ -113,7 +113,7 @@ interface SettingsFile {
 	spinnerStatusColor?: string;
 	/** Gray level 0–255 for ├─ └─ │ when branch color mode is `fixed`. */
 	toolBranchRgbGray?: number;
-	/** `theme` (default): dim → muted → thinkingText — matches thought/gray prose. `fixed`: toolBranchRgbGray. */
+	/** `fixed` (default): rgb gray 72, theme-independent. `theme`: dim → muted → borderMuted. */
 	toolBranchColorMode?: "theme" | "fixed";
 }
 
@@ -929,6 +929,7 @@ const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 const WORKED_DURATION_KEY = "_piClaudeStyleWorkedDurationMs";
 const THINKING_DURATION_KEY = "_piClaudeStyleThinkingDurationMs";
+const THINKING_ACTIVE_KEY = "_piClaudeStyleThinkingActive";
 const WORKED_START_KEY = "_piClaudeStyleWorkedStartMs";
 const WORKED_DURATION_MARKER = "Worked for";
 const MIN_THINKING_SUMMARY_MS = 100;
@@ -1031,7 +1032,9 @@ function assistantMessageThinkingComplete(message: any): boolean {
 }
 
 function hiddenThinkingSummaryForMessage(message: any): string {
-	if (thinkingBlockInFlight) return thinkingActiveSummaryText();
+	// Per-message flags win over globals so a late render pass cannot keep
+	// "Thinking…" after thinking_end already stored duration on this message.
+	if ((message as any)?.[THINKING_ACTIVE_KEY]) return thinkingActiveSummaryText();
 	const stored = (message as any)?.[THINKING_DURATION_KEY];
 	const durationMs = typeof stored === "number"
 		? stored
@@ -1041,6 +1044,7 @@ function hiddenThinkingSummaryForMessage(message: any): string {
 	if (typeof durationMs === "number" && durationMs >= MIN_THINKING_SUMMARY_MS) {
 		return thoughtDurationSummaryText(durationMs);
 	}
+	if (thinkingBlockInFlight) return thinkingActiveSummaryText();
 	return thinkingActiveSummaryText();
 }
 
@@ -1669,7 +1673,7 @@ function roundedUserBorder(width: number, top: boolean): string {
 	if (!top || width < 10) {
 		return `${BORDER_COLOR}${left}${"─".repeat(Math.max(0, width - 2))}${right}${TRANSPARENT_RESET}`;
 	}
-	const label = " User ";
+	const label = `${WORKED_LINE_FG} User ${TRANSPARENT_RESET}`;
 	const prefix = "─";
 	const suffixWidth = Math.max(0, width - 2 - visibleWidth(prefix) - visibleWidth(label));
 	return `${BORDER_COLOR}${left}${prefix}${TRANSPARENT_RESET}${label}${BORDER_COLOR}${"─".repeat(suffixWidth)}${right}${TRANSPARENT_RESET}`;
@@ -1695,21 +1699,29 @@ function borderedUserMessageLine(line: string, width: number): string {
 	return `${BORDER_COLOR}│${TRANSPARENT_RESET} ${content}${padding} ${BORDER_COLOR}│${TRANSPARENT_RESET}`;
 }
 
+function visitMarkdownDescendants(root: unknown, visit: (md: InstanceType<typeof Markdown>) => void): void {
+	if (!root || typeof root !== "object") return;
+	const node = root as { children?: unknown[] };
+	for (const child of node.children ?? []) {
+		if (child instanceof Markdown) visit(child);
+		else visitMarkdownDescendants(child, visit);
+	}
+}
+
 function patchUserMessageRender(): void {
 	const proto = UserMessageComponent.prototype as any;
 	if (proto[USER_MESSAGE_PATCH_FLAG]) return;
 	const originalRender = proto.render;
 	if (typeof originalRender !== "function") return;
 	proto.render = function patchedUserMessageRender(width: number) {
-		for (const child of (this as any).children ?? []) {
-			if (!(child instanceof Markdown)) continue;
+		visitMarkdownDescendants(this, (child) => {
 			const markdownAny = child as any;
 			makeMarkdownLinksCopySafe(child);
 			if (markdownAny.defaultTextStyle?.bgColor) {
 				markdownAny.defaultTextStyle.bgColor = undefined;
 				child.invalidate?.();
 			}
-		}
+		});
 		const borderWidth = Math.max(1, width);
 		const contentWidth = Math.max(1, borderWidth - 4);
 		const lines = originalRender.call(this, contentWidth);
@@ -2749,7 +2761,7 @@ let FG_DEL = "\x1b[38;2;200;100;100m";
 let FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_LNUM = "\x1b[38;2;100;100;100m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
-// Tool branch connectors (├─ └─ │). Fixed fallback; theme adaptive overrides below.
+// Tool branch connectors (├─ └─ │). Default fixed gray 72 — independent of pi theme.
 const DEFAULT_TOOL_BRANCH_GRAY = 72;
 
 function toolBranchRgbAnsi(gray: number): string {
@@ -2763,7 +2775,7 @@ function getConfiguredToolBranchGray(): number {
 }
 
 function toolBranchColorModeFixed(): boolean {
-	return readSettings().toolBranchColorMode === "fixed";
+	return readSettings().toolBranchColorMode !== "theme";
 }
 
 function toolBranchRenderCacheKey(): string {
@@ -2777,6 +2789,31 @@ function bumpToolBranchVisualEpoch(): void {
 	_toolBranchVisualEpoch++;
 }
 
+/** On light panels, theme dim/muted can be nearly white — pull chrome toward mid-gray. */
+function attenuateChromeAnsi(ansi: string, theme: any): string {
+	const rgb = parseAnsiRgb(ansi);
+	if (!rgb) return ansi;
+	if (!isLightThemeBackground(theme)) return ansi;
+	const lum = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+	// Already quiet enough on light backgrounds.
+	if (lum <= 145) return ansi;
+	const target = 118;
+	const t = Math.min(1, (lum - 130) / 110);
+	const mix = (c: number) => Math.round(c + (target - c) * t);
+	return `\x1b[38;2;${mix(rgb.r)};${mix(rgb.g)};${mix(rgb.b)}m`;
+}
+
+/** Shared outline chrome: user box, tool rules, code fences, branch connectors. */
+function resolveThemeChromeFg(theme: any): string | null {
+	if (!theme || !themeAdaptiveEnabled()) return null;
+	const dim = safeFgAnsi(theme, "dim");
+	const muted = safeFgAnsi(theme, "muted");
+	const borderMuted = safeFgAnsi(theme, "borderMuted");
+	const thinking = safeFgAnsi(theme, "thinkingText");
+	const raw = dim ?? muted ?? borderMuted ?? thinking;
+	return raw ? attenuateChromeAnsi(raw, theme) : null;
+}
+
 /** Resolve ├─ └─ │ color from settings + theme on every use (not a stale global). */
 let _toolBranchThemeHint: any;
 
@@ -2785,13 +2822,8 @@ function currentToolBranchAnsi(theme?: any): string {
 	if (toolBranchColorModeFixed()) {
 		return toolBranchRgbAnsi(getConfiguredToolBranchGray());
 	}
-	if (t && themeAdaptiveEnabled()) {
-		const muted = safeFgAnsi(t, "muted");
-		const dim = safeFgAnsi(t, "dim") ?? muted;
-		const thinking = safeFgAnsi(t, "thinkingText");
-		const branchFg = dim ?? muted ?? thinking;
-		if (branchFg) return branchFg;
-	}
+	const chrome = t ? resolveThemeChromeFg(t) : null;
+	if (chrome) return chrome;
 	return toolBranchRgbAnsi(getConfiguredToolBranchGray());
 }
 
@@ -3035,20 +3067,25 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	_themePaletteCacheName = themeName;
 	_themePaletteCacheFingerprint = fingerprint;
 
-	// Borders (top/bottom outlines, user-message frame, branch rule).
 	const borderMuted = safeFgAnsi(theme, "borderMuted");
-	if (borderMuted) BORDER_COLOR = borderMuted;
+	const muted = safeFgAnsi(theme, "muted");
+	const dim = safeFgAnsi(theme, "dim") ?? muted;
+
+	// User message frame, tool outline rules, code-block borders, branch connectors.
+	const chromeFg = resolveThemeChromeFg(theme);
+	if (chromeFg) {
+		const prevBorder = BORDER_COLOR;
+		BORDER_COLOR = chromeFg;
+		if (chromeFg !== prevBorder) bumpToolBranchVisualEpoch();
+	}
 
 	// "Worked for Ns" line + thinking-block italics share pi's `muted` color.
-	const muted = safeFgAnsi(theme, "muted");
 	if (muted) WORKED_LINE_FG = muted;
-
-	const dim = safeFgAnsi(theme, "dim") ?? muted;
 
 	applyToolBranchColor(theme);
 
-	// Code-block language label: prefer `dim`, then border chrome, so it stays quieter than prose.
-	const langChrome = dim ?? borderMuted ?? safeFgAnsi(theme, "mdCode");
+	// Code-block language label: prefer `dim`, then shared chrome, so it stays quieter than prose.
+	const langChrome = dim ?? chromeFg ?? borderMuted ?? safeFgAnsi(theme, "mdCode");
 	if (langChrome) CODE_BLOCK_LANG_FG = langChrome;
 
 	// Grouped-tool status counts follow the same semantic theme colors as regular tool dots.
@@ -3061,8 +3098,9 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	// we only touch the ones not explicitly set.
 	if (!_explicitFgFields.has("fgDim") && muted) FG_DIM = muted;
 	if (!_explicitFgFields.has("fgLnum") && muted) FG_LNUM = muted;
-	if (!_explicitFgFields.has("fgRule") && borderMuted) FG_RULE = borderMuted;
-	if (!_explicitFgFields.has("fgStripe") && borderMuted) FG_STRIPE = borderMuted;
+	const ruleChrome = chromeFg ?? borderMuted;
+	if (!_explicitFgFields.has("fgRule") && ruleChrome) FG_RULE = ruleChrome;
+	if (!_explicitFgFields.has("fgStripe") && ruleChrome) FG_STRIPE = ruleChrome;
 	if (!_explicitFgFields.has("fgSafeMuted") && muted) FG_SAFE_MUTED = muted;
 
 	DIVIDER = `${FG_RULE}│${D_RST}`;
@@ -4099,30 +4137,44 @@ function trackThinkingBlockEvents(event: any, ctx?: any): void {
 	const evt = event?.assistantMessageEvent;
 	const message = event?.message;
 	if (!evt || typeof evt.type !== "string") return;
-	if (evt.type === "thinking_start") {
-		thinkingBlockInFlight = true;
-		thinkingBlockStartMs = Date.now();
-		lastThinkingBlockDurationMs = undefined;
-		if (message?.role === "assistant") delete (message as any)[THINKING_DURATION_KEY];
+	function refreshThinkingChrome(): void {
 		try {
 			ctx?.ui?.invalidate?.();
 			ctx?.ui?.requestRender?.();
 		} catch { /* noop */ }
+		// Pi may call AssistantMessageComponent.updateContent before extension
+		// handlers run on the same thinking_end event — nudge one more frame.
+		setTimeout(() => {
+			try {
+				ctx?.ui?.invalidate?.();
+				ctx?.ui?.requestRender?.();
+			} catch { /* noop */ }
+		}, 0);
+	}
+
+	if (evt.type === "thinking_start") {
+		thinkingBlockInFlight = true;
+		thinkingBlockStartMs = Date.now();
+		lastThinkingBlockDurationMs = undefined;
+		if (message?.role === "assistant") {
+			(message as any)[THINKING_ACTIVE_KEY] = true;
+			delete (message as any)[THINKING_DURATION_KEY];
+		}
+		refreshThinkingChrome();
 		return;
 	}
 	if (evt.type === "thinking_end") {
 		thinkingBlockInFlight = false;
 		const duration = Date.now() - thinkingBlockStartMs;
+		if (message?.role === "assistant") delete (message as any)[THINKING_ACTIVE_KEY];
 		if (duration >= MIN_THINKING_SUMMARY_MS) {
 			lastThinkingBlockDurationMs = duration;
 			if (message?.role === "assistant") (message as any)[THINKING_DURATION_KEY] = duration;
 		} else {
 			lastThinkingBlockDurationMs = undefined;
+			if (message?.role === "assistant") delete (message as any)[THINKING_DURATION_KEY];
 		}
-		try {
-			ctx?.ui?.invalidate?.();
-			ctx?.ui?.requestRender?.();
-		} catch { /* noop */ }
+		refreshThinkingChrome();
 	}
 }
 
@@ -4164,6 +4216,7 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 			currentAssistantMessageStartMs = Date.now();
 			(message as any)[WORKED_START_KEY] = currentAssistantMessageStartMs;
 			thinkingBlockInFlight = false;
+			delete (message as any)[THINKING_ACTIVE_KEY];
 		}
 	});
 	pi.on("message_update", async (event, ctx) => {
@@ -5157,11 +5210,18 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI) return;
 		const branchMode = toolBranchColorModeFixed() ? "fixed" : "theme";
 		const branchGray = getConfiguredToolBranchGray();
+		const theme = ctx.ui?.theme;
+		const chromeHint = branchMode === "theme" && theme
+			? (resolveThemeChromeFg(theme) ? " (attenuated on light themes)" : " (fallback gray if theme keys missing)")
+			: "";
+		const branchLine = branchMode === "fixed"
+			? `Branch color: fixed rgb(${branchGray})`
+			: `Branch color: theme${chromeHint}`;
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
-			`Branch color: ${branchMode} (gray ${branchGray}${branchMode === "fixed" ? " default" : ""})`,
+			branchLine,
 			`  /cc-tools branch <0-255> | theme | fixed | reset`,
 		].join("\n"), "info");
 	};
@@ -5238,13 +5298,13 @@ export default function (pi: ExtensionAPI) {
 					writeSettingsKey("toolBranchRgbGray", undefined);
 					writeSettingsKey("toolBranchColorMode", undefined);
 					if (ctx.hasUI) refreshAllToolBranchVisuals(ctx);
-					if (ctx.hasUI) ctx.ui.notify("Branch color → follow theme (dim / muted / thinking)", "info");
+					if (ctx.hasUI) ctx.ui.notify(`Branch color → fixed rgb(${DEFAULT_TOOL_BRANCH_GRAY}) (default)`, "info");
 					return;
 				}
 				if (arg === "theme") {
 					writeSettingsKey("toolBranchColorMode", "theme");
 					if (ctx.hasUI) refreshAllToolBranchVisuals(ctx);
-					if (ctx.hasUI) ctx.ui.notify("Branch color → follow pi theme (dim → muted → thinking)", "info");
+					if (ctx.hasUI) ctx.ui.notify("Branch color → follow pi theme (dim/muted)", "info");
 					return;
 				}
 				if (arg === "fixed") {
@@ -5329,10 +5389,11 @@ export default function (pi: ExtensionAPI) {
 					const statusKey = settings.spinnerStatusColor || "muted";
 					const verbAnsi = safeFgAnsi(theme, verbKey) ?? safeFgAnsi(theme, "accent");
 					const statusAnsi = safeFgAnsi(theme, statusKey) ?? safeFgAnsi(theme, "muted");
+					const chromePreview = resolveThemeChromeFg(theme);
 					// Print a short preview of what we derived.
 					const preview = [
-						`borders     : ${safeFgAnsi(theme, "borderMuted") ? `${safeFgAnsi(theme, "borderMuted")}────\x1b[39m` : "(unchanged)"}`,
-						`branches    : ${safeFgAnsi(theme, "dim") ?? safeFgAnsi(theme, "muted") ? `${safeFgAnsi(theme, "dim") ?? safeFgAnsi(theme, "muted")}├─ └─\x1b[39m` : "(unchanged)"}`,
+						`chrome      : ${chromePreview ? `${chromePreview}─┌ User ├─\x1b[39m` : "(unchanged)"}`,
+						`  (user box, tool rules, branches)`, 
 						`muted text  : ${safeFgAnsi(theme, "muted") ? `${safeFgAnsi(theme, "muted")}example dim text\x1b[39m` : "(unchanged)"}`,
 						`diff add    : ${safeFgAnsi(theme, "toolDiffAdded") ? `${safeFgAnsi(theme, "toolDiffAdded")}+ added line\x1b[39m` : "(unchanged)"}`,
 						`diff del    : ${safeFgAnsi(theme, "toolDiffRemoved") ? `${safeFgAnsi(theme, "toolDiffRemoved")}- removed line\x1b[39m` : "(unchanged)"}`,

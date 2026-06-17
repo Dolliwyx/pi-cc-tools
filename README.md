@@ -55,8 +55,8 @@ When `themeAdaptive` is `true` (default), the following colors are derived from 
 
 | Element | Derived from |
 |---------|--------------|
-| Tool outline borders (top/bottom rules) | `borderMuted` |
-| Branch connectors (`├─`, `└─`, `│`) | `dim` (fallback: `muted`) |
+| User box, tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
+| Branch connectors (`├─`, `└─`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
 | "✻ Worked for Ns" line | `muted` |
 | Thinking-block italic gray | `muted` |
 | Diff add/remove accents | `toolDiffAdded` / `toolDiffRemoved` |

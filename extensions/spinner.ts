@@ -703,6 +703,8 @@ export default function (pi: ExtensionAPI) {
 		if (statusChanged) {
 			syncWorkingMessage(true);
 			rescheduleRefreshLoop();
+			// Same-frame ordering: ensure footer updates even if pi rendered first.
+			setTimeout(() => syncWorkingMessage(true), 0);
 			return;
 		}
 
