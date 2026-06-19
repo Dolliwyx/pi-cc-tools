@@ -937,6 +937,52 @@ function safeInvalidate(ctx: any): void {
 const ASSISTANT_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message");
 const ASSISTANT_RENDER_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message-render");
 const TOOL_EXECUTION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-execution");
+
+// Rendered-output cache for assistant/user/custom message components.
+// Keyed by (width, branch visual epoch, tool background mode). The epoch changes on
+// theme / /cc-tools branch / /cc-theme rebinds; the mode is included because subagent
+// (custom-message) framing follows `toolBackgroundMode` via frameToolLikeLines. This avoids
+// re-running the per-line ANSI stripping (applyTerminalCopyZones, normalizeLeadingCheckGlyph,
+// border boxing) on every scroll/expand re-render — the dominant CPU cost on long chats,
+// scaling linearly with chat length.
+// Correctness:
+//  - UserMessageComponent content is immutable after construction, so output is deterministic
+//    given (width, epoch, mode).
+//  - AssistantMessageComponent rebuilds children only via updateContent(), which clears the cache.
+//  - CustomMessageComponent rebuilds children only via rebuild(), which clears the cache.
+// The returned arrays are only ever spread-copied by Container.render (never mutated in place),
+// so sharing the cached array reference across renders is safe.
+const MESSAGE_RENDER_CACHE = Symbol.for("pi-claude-style-tools:message-render-cache");
+
+function messageRenderCacheHit(thisArg: any, width: number): string[] | null {
+	const cache = thisArg?.[MESSAGE_RENDER_CACHE];
+	if (
+		cache
+		&& cache.width === width
+		&& cache.epoch === _toolBranchVisualEpoch
+		&& cache.mode === toolBackgroundMode
+		&& Array.isArray(cache.lines)
+	) {
+		return cache.lines;
+	}
+	return null;
+}
+
+function storeMessageRenderCache(thisArg: any, width: number, lines: string[]): string[] {
+	if (thisArg && typeof thisArg === "object") {
+		thisArg[MESSAGE_RENDER_CACHE] = {
+			width,
+			epoch: _toolBranchVisualEpoch,
+			mode: toolBackgroundMode,
+			lines,
+		};
+	}
+	return lines;
+}
+
+function clearMessageRenderCache(thisArg: any): void {
+	if (thisArg && typeof thisArg === "object") thisArg[MESSAGE_RENDER_CACHE] = undefined;
+}
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
@@ -1651,13 +1697,29 @@ function patchCustomMessageRender(): void {
 	const originalRender = proto.render;
 	if (typeof originalRender !== "function") return;
 	proto.render = function patchedCustomMessageRender(width: number) {
+		// Subagent framing follows `toolBackgroundMode` (via frameToolLikeLines), which
+		// can change via /cc-tools or by editing settings.json. Re-sync before the
+		// cache check so the mode key reflects the current setting on warm renders too.
+		syncToolBackgroundMode();
+		const cached = messageRenderCacheHit(this, width);
+		if (cached) return cached;
 		const lines = originalRender.call(this, width);
 		if (!Array.isArray(lines)) return lines;
-		if (isSubagentNotificationMessage(this?.message)) {
-			return formatSubagentNotification(lines, width);
-		}
-		return lines.map(normalizeLeadingCheckGlyph);
+		const result = isSubagentNotificationMessage(this?.message)
+			? formatSubagentNotification(lines, width)
+			: lines.map(normalizeLeadingCheckGlyph);
+		return storeMessageRenderCache(this, width, result);
 	};
+	// CustomMessageComponent rebuilds its children via rebuild() (called from
+	// invalidate() and setExpanded()); drop the cached render so the next render
+	// reflects the rebuilt content.
+	const originalRebuild = proto.rebuild;
+	if (typeof originalRebuild === "function") {
+		proto.rebuild = function patchedCustomMessageRebuild(...args: any[]) {
+			clearMessageRenderCache(this);
+			return originalRebuild.apply(this, args);
+		};
+	}
 	proto[CUSTOM_MESSAGE_PATCH_FLAG] = true;
 }
 
@@ -1734,6 +1796,8 @@ function patchUserMessageRender(): void {
 	const originalRender = proto.render;
 	if (typeof originalRender !== "function") return;
 	proto.render = function patchedUserMessageRender(width: number) {
+		const cached = messageRenderCacheHit(this, width);
+		if (cached) return cached;
 		visitMarkdownDescendants(this, (child) => {
 			const markdownAny = child as any;
 			makeMarkdownLinksCopySafe(child);
@@ -1752,7 +1816,7 @@ function patchUserMessageRender(): void {
 			roundedUserBorder(borderWidth, false),
 		];
 		const clamped = rendered.map((line) => clampLineWidth(line, borderWidth));
-		return applyTerminalCopyZones(clamped);
+		return storeMessageRenderCache(this, width, applyTerminalCopyZones(clamped));
 	};
 	proto[USER_MESSAGE_PATCH_FLAG] = true;
 }
@@ -1763,15 +1827,24 @@ function patchAssistantMessages(): void {
 	const originalRender = proto.render;
 	if (typeof originalRender === "function" && !proto[ASSISTANT_RENDER_PATCH_FLAG]) {
 		proto.render = function patchedAssistantMessageRender(width: number) {
+			const cached = messageRenderCacheHit(this, width);
+			if (cached) return cached;
 			const lines = originalRender.call(this, width);
 			if (!Array.isArray(lines) || lines.length === 0) return lines;
-			if ((this as any).hasToolCalls) return lines;
-			return applyTerminalCopyZones(lines);
+			if ((this as any).hasToolCalls) {
+				// Tool-call messages skip copy-zone processing, but still benefit from
+				// caching the rendered output to avoid re-rendering stable children.
+				return storeMessageRenderCache(this, width, lines);
+			}
+			return storeMessageRenderCache(this, width, applyTerminalCopyZones(lines));
 		};
 		proto[ASSISTANT_RENDER_PATCH_FLAG] = true;
 	}
 	const originalUpdateContent = proto.updateContent;
 	proto.updateContent = function patchedUpdateContent(message: any) {
+		// Content changed (also reached via invalidate() → updateContent): drop the
+		// cached rendered output so the next render rebuilds with the new children.
+		clearMessageRenderCache(this);
 		if (!(this as any)[WORKED_START_KEY]) {
 			(this as any)[WORKED_START_KEY] = Date.now();
 		}
