@@ -1848,11 +1848,19 @@ function userMessageStyle(): "border" | "highlight" | "plain" {
 		: "border";
 }
 
-function highlightedUserMessageLine(line: string, width: number): string {
+function trimUserMessageTextLines(lines: string[]): string[] {
+	let start = 0;
+	while (start < lines.length && !lines[start].trim()) start++;
+	let end = lines.length - 1;
+	while (end >= start && !lines[end].trim()) end--;
+	return start <= end ? lines.slice(start, end + 1) : [];
+}
+
+function highlightedUserMessageLine(text: string, width: number, showPrefix: boolean): string {
 	const bg = safeBgAnsi(getGlobalPiTheme(), "selectedBg") ?? "\x1b[48;5;238m";
-	const content = clampLineWidth(cleanUserMessageText(line), width);
+	const content = clampLineWidth(`${showPrefix ? "❯ " : "  "}${text}`, width);
 	const padding = " ".repeat(Math.max(0, width - visibleWidth(content)));
-	return `${bg}${content}${padding}${TRANSPARENT_RESET}`;
+	return content ? `${bg}${content}${padding}${TRANSPARENT_RESET}` : "";
 }
 
 function borderedUserMessageLine(line: string, width: number): string {
@@ -1897,7 +1905,9 @@ function patchUserMessageRender(): void {
 			return storeMessageRenderCache(this, width, applyTerminalCopyZones(clamped));
 		}
 		if (style === "highlight") {
-			const highlighted = lines.map((line: string) => highlightedUserMessageLine(line, borderWidth));
+			const highlightLines = trimUserMessageTextLines(lines.map((line: string) => cleanUserMessageText(line)))
+				.filter((line) => line.trim());
+			const highlighted = highlightLines.map((line: string, index: number) => highlightedUserMessageLine(line, borderWidth, index === 0));
 			return storeMessageRenderCache(this, width, applyTerminalCopyZones(highlighted));
 		}
 		const rendered = [
