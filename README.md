@@ -39,6 +39,7 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "extraExpandedPreviewMaxLines": 12000,
   "extraToolOutputExpanded": false,
   "groupToolCalls": true,
+  "userMessageStyle": "border",
   "userMessageBorder": true,
   "codeBlockBorder": true,
   "bashOutputMode": "opencode",
@@ -51,7 +52,7 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
 }
 ```
 
-Set `userMessageBorder: false` to render user prompts without the custom rounded box.
+`userMessageStyle` accepts `"border"`, `"highlight"`, or `"plain"`. `userMessageBorder: false` is kept for backward compatibility and behaves like `"plain"`.
 Set `codeBlockBorder: false` to render assistant code fences without the custom rounded box.
 
 ### Theme integration

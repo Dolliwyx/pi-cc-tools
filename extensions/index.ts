@@ -82,7 +82,9 @@ interface SettingsFile {
 	extraExpandedPreviewMaxLines?: number;
 	extraToolOutputExpanded?: boolean;
 	groupToolCalls?: boolean;
-	/** When false, render user prompts without the custom rounded border. Defaults to true. */
+	/** User prompt rendering style. Defaults to "border". */
+	userMessageStyle?: "border" | "highlight" | "plain";
+	/** Backward compat: when false, userMessageStyle behaves as "plain". */
 	userMessageBorder?: boolean;
 	/** When false, render assistant code fences without the custom rounded border. Defaults to true. */
 	codeBlockBorder?: boolean;
@@ -978,7 +980,7 @@ const MESSAGE_RENDER_CACHE = Symbol.for("pi-claude-style-tools:message-render-ca
 
 function messageRenderSettingsKey(): string {
 	const settings = readSettings();
-	return `${settings.userMessageBorder !== false}:${settings.codeBlockBorder !== false}`;
+	return `${userMessageStyle()}:${settings.codeBlockBorder !== false}`;
 }
 
 function messageRenderCacheHit(thisArg: any, width: number): string[] | null {
@@ -1834,6 +1836,25 @@ function cleanUserMessageLine(line: string): string {
 	return `${TRANSPARENT_BG}${trimAnsiRight(stripBackgroundAnsi(stripOsc133Zones(line)))}${TRANSPARENT_BG}`;
 }
 
+function cleanUserMessageText(line: string): string {
+	return trimAnsiRight(stripBackgroundAnsi(stripOsc133Zones(line)));
+}
+
+function userMessageStyle(): "border" | "highlight" | "plain" {
+	const settings = readSettings();
+	if (settings.userMessageBorder === false) return "plain";
+	return settings.userMessageStyle === "highlight" || settings.userMessageStyle === "plain"
+		? settings.userMessageStyle
+		: "border";
+}
+
+function highlightedUserMessageLine(line: string, width: number): string {
+	const bg = safeBgAnsi(getGlobalPiTheme(), "selectedBg") ?? "\x1b[48;5;238m";
+	const content = clampLineWidth(cleanUserMessageText(line), width);
+	const padding = " ".repeat(Math.max(0, width - visibleWidth(content)));
+	return `${bg}${content}${padding}${TRANSPARENT_RESET}`;
+}
+
 function borderedUserMessageLine(line: string, width: number): string {
 	const innerWidth = Math.max(1, width - 4);
 	const content = clampLineWidth(cleanUserMessageLine(line), innerWidth);
@@ -1866,14 +1887,18 @@ function patchUserMessageRender(): void {
 				child.invalidate?.();
 			}
 		});
-		const userMessageBorderEnabled = readSettings().userMessageBorder !== false;
+		const style = userMessageStyle();
 		const borderWidth = Math.max(1, width);
-		const contentWidth = userMessageBorderEnabled ? Math.max(1, borderWidth - 4) : borderWidth;
+		const contentWidth = style === "border" ? Math.max(1, borderWidth - 4) : borderWidth;
 		const lines = originalRender.call(this, contentWidth);
 		if (!Array.isArray(lines) || lines.length === 0) return lines;
-		if (!userMessageBorderEnabled) {
+		if (style === "plain") {
 			const clamped = lines.map((line: string) => clampLineWidth(cleanUserMessageLine(line), borderWidth));
 			return storeMessageRenderCache(this, width, applyTerminalCopyZones(clamped));
+		}
+		if (style === "highlight") {
+			const highlighted = lines.map((line: string) => highlightedUserMessageLine(line, borderWidth));
+			return storeMessageRenderCache(this, width, applyTerminalCopyZones(highlighted));
 		}
 		const rendered = [
 			roundedUserBorder(borderWidth, true),
