@@ -1260,9 +1260,8 @@ const MATH_COMMANDS: Record<string, string> = {
 
 const COPY_SAFE_MARKDOWN_LINKS_FLAG = Symbol.for("pi-claude-style-tools:copy-safe-markdown-links");
 
-/** Unordered list marker: monochrome ◉ (fisheye) instead of "- " (thinking blocks skip this). */
+/** Keep assistant unordered list markers as markdown-style dashes. */
 function assistantListBulletMarker(marker: string): string {
-	if (marker.startsWith("- ")) return `◉ ${marker.slice(2)}`;
 	return marker;
 }
 
