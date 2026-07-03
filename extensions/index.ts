@@ -5588,7 +5588,8 @@ export default function (pi: ExtensionAPI) {
 	// /cc-tools command — control tool chrome, grouping, and detail level.
 	const TOOL_MODES = ["outlines", "transparent", "default"] as const;
 	const TOOL_BOOL_MODES = ["on", "off", "toggle", "status"] as const;
-	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "branch", "status"] as const;
+	const USER_MESSAGE_STYLES = ["border", "highlight", "plain", "status"] as const;
+	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "branch", "user", "code-border", "status"] as const;
 	const booleanMode = (raw: string | undefined, current: boolean): boolean | "status" | undefined => {
 		const mode = raw || "toggle";
 		if (mode === "on") return true;
@@ -5611,8 +5612,12 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
+			`User messages: ${userMessageStyle()}`,
+			`Code block border: ${readSettings().codeBlockBorder !== false ? "on" : "off"}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
 			branchLine,
+			`  /cc-tools user border|highlight|plain`,
+			`  /cc-tools code-border on|off|toggle`,
 			`  /cc-tools branch <0-255> | theme | fixed | reset`,
 		].join("\n"), "info");
 	};
@@ -5631,6 +5636,8 @@ export default function (pi: ExtensionAPI) {
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
 							: m === "branch" ? "├─ └─ │ gray (0-255), theme, fixed, or reset"
+							: m === "user" ? "Set user prompt style"
+							: m === "code-border" ? "Toggle assistant code fence borders"
 							: m === "status" ? "Show tool UI settings"
 							: m === "outlines" ? "Horizontal rules around each tool (default)"
 							: m === "transparent" ? "No borders or backgrounds"
@@ -5644,7 +5651,13 @@ export default function (pi: ExtensionAPI) {
 					.filter((o) => o.startsWith(second))
 					.map((o) => ({ value: `branch ${o}`, label: o, description: "Branch connector color" }));
 			}
-			if (first === "group" || first === "detail" || first === "extra") {
+			if (first === "user") {
+				const second = parts[1] ?? "";
+				return USER_MESSAGE_STYLES
+					.filter((m) => m.startsWith(second))
+					.map((m) => ({ value: `user ${m}`, label: m, description: "User prompt style" }));
+			}
+			if (first === "group" || first === "detail" || first === "extra" || first === "code-border") {
 				const second = parts[1] ?? "";
 				return TOOL_BOOL_MODES
 					.filter((m) => m.startsWith(second))
@@ -5657,6 +5670,45 @@ export default function (pi: ExtensionAPI) {
 			const sub = parts[0] ?? "";
 			if (!sub || sub === "status") {
 				notifyToolStatus(ctx);
+				return;
+			}
+
+			if (sub === "user") {
+				const style = parts[1] ?? "status";
+				if (style === "status" || !style) {
+					if (ctx.hasUI) ctx.ui.notify(`User messages: ${userMessageStyle()}`, "info");
+					return;
+				}
+				if (!(USER_MESSAGE_STYLES as readonly string[]).includes(style) || style === "status") {
+					if (ctx.hasUI) ctx.ui.notify("Usage: /cc-tools user border|highlight|plain|status", "error");
+					return;
+				}
+				writeSettingsKey("userMessageStyle", style);
+				if (style !== "plain") writeSettingsKey("userMessageBorder", true);
+				if (ctx.hasUI) {
+					ctx.ui.invalidate?.();
+					ctx.ui.requestRender?.();
+					ctx.ui.notify(`User messages → ${style}`, "info");
+				}
+				return;
+			}
+
+			if (sub === "code-border") {
+				const next = booleanMode(parts[1], readSettings().codeBlockBorder !== false);
+				if (next === undefined) {
+					if (ctx.hasUI) ctx.ui.notify(`Usage: /cc-tools code-border ${TOOL_BOOL_MODES.join("|")}`, "error");
+					return;
+				}
+				if (next === "status") {
+					if (ctx.hasUI) ctx.ui.notify(`Code block border: ${readSettings().codeBlockBorder !== false ? "on" : "off"}`, "info");
+					return;
+				}
+				writeSettingsKey("codeBlockBorder", next);
+				if (ctx.hasUI) {
+					ctx.ui.invalidate?.();
+					ctx.ui.requestRender?.();
+					ctx.ui.notify(`Code block border: ${next ? "on" : "off"}`, "info");
+				}
 				return;
 			}
 

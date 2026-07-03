@@ -112,8 +112,10 @@ The selection is persisted as `spinnerVerbColor` / `spinnerStatusColor` in `~/.p
 Use `/cc-tools` to control tool UI at runtime:
 
 ```text
-/cc-tools status          # show style, grouping, and extra-detail state
+/cc-tools status          # show style, grouping, user/code borders, and extra detail
 /cc-tools outlines        # tool style: outlines, transparent, or default
+/cc-tools user highlight  # user prompt style: border, highlight, or plain
+/cc-tools code-border off # toggle assistant code fence borders
 /cc-tools group toggle    # toggle grouped adjacent/concurrent tool calls
 /cc-tools group off       # disable grouping (also ungroups current grouped rows)
 /cc-tools detail toggle   # same mode as Ctrl+Shift+O
