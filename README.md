@@ -39,6 +39,8 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "extraExpandedPreviewMaxLines": 12000,
   "extraToolOutputExpanded": false,
   "groupToolCalls": true,
+  "userMessageBorder": true,
+  "codeBlockBorder": true,
   "bashOutputMode": "opencode",
   "bashCollapsedLines": 10,
   "liveToolPreview": true,
@@ -48,6 +50,9 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "diffTheme": "github-dark"
 }
 ```
+
+Set `userMessageBorder: false` to render user prompts without the custom rounded box.
+Set `codeBlockBorder: false` to render assistant code fences without the custom rounded box.
 
 ### Theme integration
 

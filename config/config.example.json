@@ -8,6 +8,8 @@
   "extraExpandedPreviewMaxLines": 12000,
   "extraToolOutputExpanded": false,
   "groupToolCalls": true,
+  "userMessageBorder": true,
+  "codeBlockBorder": true,
   "bashOutputMode": "opencode",
   "bashCollapsedLines": 10,
   "liveToolPreview": true,

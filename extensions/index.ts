@@ -82,6 +82,10 @@ interface SettingsFile {
 	extraExpandedPreviewMaxLines?: number;
 	extraToolOutputExpanded?: boolean;
 	groupToolCalls?: boolean;
+	/** When false, render user prompts without the custom rounded border. Defaults to true. */
+	userMessageBorder?: boolean;
+	/** When false, render assistant code fences without the custom rounded border. Defaults to true. */
+	codeBlockBorder?: boolean;
 	bashOutputMode?: "opencode" | "summary" | "preview";
 	bashCollapsedLines?: number;
 	/** Show a small live output preview while tools are still running. Defaults to true. */
@@ -367,6 +371,7 @@ function boxRenderedCodeBlock(bodyLines: string[], language: string, width: numb
 }
 
 function sanitizeRenderedTextBlockLines(lines: string[], width?: number): string[] {
+	const codeBlockBorderEnabled = readSettings().codeBlockBorder !== false;
 	const result: string[] = [];
 	let i = 0;
 	const canBox = typeof width === "number" && width > 0;
@@ -386,7 +391,7 @@ function sanitizeRenderedTextBlockLines(lines: string[], width?: number): string
 				body.push(lines[i]);
 				i++;
 			}
-			if (hideBox) {
+			if (hideBox || !codeBlockBorderEnabled) {
 				result.push(...body);
 			} else if (canBox && (body.length > 0 || language.trim())) {
 				result.push(...boxRenderedCodeBlock(body, language, width));
@@ -971,6 +976,11 @@ const TOOL_EXECUTION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool
 // so sharing the cached array reference across renders is safe.
 const MESSAGE_RENDER_CACHE = Symbol.for("pi-claude-style-tools:message-render-cache");
 
+function messageRenderSettingsKey(): string {
+	const settings = readSettings();
+	return `${settings.userMessageBorder !== false}:${settings.codeBlockBorder !== false}`;
+}
+
 function messageRenderCacheHit(thisArg: any, width: number): string[] | null {
 	const cache = thisArg?.[MESSAGE_RENDER_CACHE];
 	if (
@@ -978,6 +988,7 @@ function messageRenderCacheHit(thisArg: any, width: number): string[] | null {
 		&& cache.width === width
 		&& cache.epoch === _toolBranchVisualEpoch
 		&& cache.mode === toolBackgroundMode
+		&& cache.settingsKey === messageRenderSettingsKey()
 		&& Array.isArray(cache.lines)
 	) {
 		return cache.lines;
@@ -991,6 +1002,7 @@ function storeMessageRenderCache(thisArg: any, width: number, lines: string[]): 
 			width,
 			epoch: _toolBranchVisualEpoch,
 			mode: toolBackgroundMode,
+			settingsKey: messageRenderSettingsKey(),
 			lines,
 		};
 	}
@@ -1854,10 +1866,15 @@ function patchUserMessageRender(): void {
 				child.invalidate?.();
 			}
 		});
+		const userMessageBorderEnabled = readSettings().userMessageBorder !== false;
 		const borderWidth = Math.max(1, width);
-		const contentWidth = Math.max(1, borderWidth - 4);
+		const contentWidth = userMessageBorderEnabled ? Math.max(1, borderWidth - 4) : borderWidth;
 		const lines = originalRender.call(this, contentWidth);
 		if (!Array.isArray(lines) || lines.length === 0) return lines;
+		if (!userMessageBorderEnabled) {
+			const clamped = lines.map((line: string) => clampLineWidth(cleanUserMessageLine(line), borderWidth));
+			return storeMessageRenderCache(this, width, applyTerminalCopyZones(clamped));
+		}
 		const rendered = [
 			roundedUserBorder(borderWidth, true),
 			...lines.map((line: string) => borderedUserMessageLine(line, borderWidth)),
