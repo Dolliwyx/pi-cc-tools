@@ -1904,8 +1904,7 @@ function patchUserMessageRender(): void {
 			return storeMessageRenderCache(this, width, applyTerminalCopyZones(clamped));
 		}
 		if (style === "highlight") {
-			const highlightLines = trimUserMessageTextLines(lines.map((line: string) => cleanUserMessageText(line)))
-				.filter((line) => line.trim());
+			const highlightLines = trimUserMessageTextLines(lines.map((line: string) => cleanUserMessageText(line)));
 			const highlighted = highlightLines.map((line: string, index: number) => highlightedUserMessageLine(line, borderWidth, index === 0));
 			return storeMessageRenderCache(this, width, applyTerminalCopyZones(highlighted));
 		}
