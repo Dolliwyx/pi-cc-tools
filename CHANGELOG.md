@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.67 — 2026-07-15
+
+### Fixed
+
+- **Magic Context tool rendering** — `ctx_search`, `ctx_memory`, `ctx_note`, `ctx_expand`, `ctx_reduce`, and `todowrite` now use the same Claude-style tool rows as other external tools.
+- **Todo overlay labels** — task IDs no longer display a leading `#`.
+- **Hermes memory notice styling** — the auto-review notice now matches thinking text color and weight instead of applying additional ANSI dimming.
+
 ## 1.0.66 — 2026-07-15
 
 ### Fixed
