@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.68 — 2026-07-15
+
+### Fixed
+
+- **Stale tool-group headers / weird counts** — settled `ToolGroupComponent` rows no longer keep serving a cached header after a child tool finishes or updates. Child mutations now mark only the parent group dirty (no sibling cascade), so counts like `N running` clear immediately instead of lingering until the next tool/message.
+- **Long-chat tool-group re-render cost** — fully-settled groups memoize their rendered lines and skip child walks on warm frames (scroll, spinner, expand elsewhere). This was the main remaining long-history regression vs stock pi when `groupToolCalls` is on.
+- **Preview styling O(output)** — `buildPreviewText` now styles only the lines that will be shown; bash finished/collapsed paths collect a tail (or count-only) instead of materializing every non-empty line; live previews reuse the single-pass collector.
+- **Todo overlay hot path** — non-todo containers bail after the first non-empty line instead of scanning every rendered line on every frame.
+- **Shiki cache across turns** — `hlCache` is no longer wiped on every `turn_end` (still cleared on session shutdown / theme rebind). Repeated expand/scroll of the same diffs no longer re-highlights from scratch each turn.
+- **Session map cleanup** — `WRITE_EXISTED_BEFORE` is cleared on `session_shutdown` so long-lived agent processes don’t retain per-write entries forever.
+
+### Performance notes
+
+Bench (`bun scripts/benchmark-tools.ts`, width 120):
+
+| Case | baseline warm | full (this package) warm |
+|------|---------------|---------------------------|
+| assistant-history-120 | ~0.44 ms | **~0.09 ms** (faster than stock) |
+| tool-history-120 (grouped) | ~0.43 ms | **~0.27 ms** (faster than stock) |
+| tool-history-240 (grouped) | ~0.90 ms | ~1.2 ms (first-render still heavier due to outlines/diffs; warm path much closer) |
+
+Cold/first render of rich tool chrome is still intentionally heavier than stock pi (borders, branch connectors, diff previews). Warm long-chat frames — the lag users feel while scrolling — are now at or below stock for assistant history and grouped tool history.
+
 ## 1.0.67 — 2026-07-15
 
 ### Fixed
