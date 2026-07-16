@@ -133,7 +133,7 @@ const neq = (a: string[], b: string[], label: string) => {
 		if (!ccTools) throw new Error("cc-tools command not registered");
 		const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded() { return false; }, setToolsExpanded() {} } } as any;
 		const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-		// A full-width rule line (borderLine) is all '─' chars; branch connectors '└─' are not.
+		// A full-width rule line (borderLine) is all '─' chars; branch connectors '└' are not.
 		const hasFullWidthRule = (lines: string[]) =>
 			lines.some((l) => { const p = stripAnsi(l); return /^─+$/.test(p) && p.length > 5; });
 
@@ -205,8 +205,8 @@ const neq = (a: string[], b: string[], label: string) => {
 	const lines = widget.render(W);
 	const plain = lines.map(stripAnsi);
 	if (plain[0] !== " ● Todos — 1/2 completed") throw new Error("todo overlay heading did not gain one indent");
-	if (plain[1] !== " ├─ ✓ done Done" || plain[2] !== " └─ ◐ next Next") {
-		throw new Error("todo overlay branch rows did not gain one indent and remove todo ID hashes");
+	if (plain[1] !== " ├ ✓ done Done" || plain[2] !== " └ ◐ next Next") {
+		throw new Error("todo overlay branch rows did not strip arm, indent, and remove todo ID hashes");
 	}
 	if (!lines[1].includes("\x1b[38;")) throw new Error("todo overlay branch did not receive branch chrome");
 	console.log("OK  todo overlay: branch chrome + one indent");

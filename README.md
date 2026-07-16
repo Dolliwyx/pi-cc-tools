@@ -1,4 +1,4 @@
-# pi-claude-style-tools
+# pi-claude-code-ui
 
 Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots, branch connectors, file icons, and configurable output modes.
 
@@ -56,7 +56,7 @@ When `themeAdaptive` is `true` (default), the following colors are derived from 
 | Element | Derived from |
 |---------|--------------|
 | User box, tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
-| Branch connectors (`├─`, `└─`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
+| Branch connectors (`├`, `└`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
 | "✻ Turn took Ns" line (final message only, with session total + turn count) | `muted` |
 | Thinking-block text and `∴` marker (marker hidden when thinking is collapsed) | `muted` |
 | Diff add/remove accents | `toolDiffAdded` / `toolDiffRemoved` |

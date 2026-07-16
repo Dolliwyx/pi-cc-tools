@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.69 — 2026-07-17
+
+### Changed
+
+- **Package rename** — npm package is now `pi-claude-code-ui` (was `pi-claude-style-tools`). Install with `pi install npm:pi-claude-code-ui` (or your usual npm/pi install path).
+- **Claude-style status dots** — pending markers no longer fall back to a hollow outlined `○`. They now blink as a bold filled `●` that is either solid or fully gone (space-kept alignment), matching Claude Code.
+- **Heavier (not huge) dots** — success/error/pending use bold `●` (not oversized `⬤`) so they read a bit larger without dominating the tool title.
+- **Bare branch connectors** — tree leads use `├` / `└` with no horizontal `─` arm, including Magic Context todo overlay rows (armed `├─` / `└─` input is normalized to bare).
+
 ## 1.0.68 — 2026-07-15
 
 ### Changed
