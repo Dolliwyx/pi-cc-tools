@@ -1,4 +1,15 @@
-# pi-claude-style-tools
+# pi-claude-code-ui
+
+> [!IMPORTANT]
+> **Package renamed in 1.0.69.** This project is now published as [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui) (was `pi-claude-style-tools`).
+>
+> Install / migrate:
+> ```bash
+> pi install npm:pi-claude-code-ui
+> # or
+> npm i pi-claude-code-ui
+> ```
+> See [CHANGELOG 1.0.69](./CHANGELOG.md#1069--2026-07-17) for the full release notes (status dots, bare branch connectors, and more).
 
 Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots, branch connectors, file icons, and configurable output modes.
 
@@ -62,9 +73,9 @@ When `themeAdaptive` is `true` (default), the following colors are derived from 
 | Element | Derived from |
 |---------|--------------|
 | User box, tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
-| Branch connectors (`├─`, `└─`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
+| Branch connectors (`├`, `└`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
 | "✻ Turn took Ns" line (final message only, with session total + turn count) | `muted` |
-| Thinking-block italic gray | `muted` |
+| Thinking-block text and `∴` marker (marker hidden when thinking is collapsed) | `muted` |
 | Diff add/remove accents | `toolDiffAdded` / `toolDiffRemoved` |
 | Diff background tints | mixed against `toolSuccessBg` base |
 | Spinner verb text (`Working…`) | `borderAccent` (fallback: `accent`) |

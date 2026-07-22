@@ -49,7 +49,7 @@ const TRANSPARENT_BG = "\x1b[49m";
 const TRANSPARENT_RESET = `${RESET}${TRANSPARENT_BG}`;
 
 // User/code box borders and thinking/thought text: branch color + OUTLINE_CHROME_BRIGHTEN.
-// Branch ├─└─│ stay at `currentToolBranchAnsi` (see syncOutlineChromeFromBranch).
+// Branch ├└│ stay at `currentToolBranchAnsi` (see syncOutlineChromeFromBranch).
 let BORDER_COLOR = "\x1b[38;5;238m";
 let CODE_BLOCK_LANG_FG = "\x1b[38;2;95;95;95m";
 const CHROME_ITALIC = "\x1b[3m";
@@ -65,7 +65,7 @@ const TOOL_CACHE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-cac
 const TOOL_IMAGE_EXPAND_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-read-image-expansion");
 const CUSTOM_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-custom-message-render");
 const USER_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-user-message-render");
-const RTK_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-rtk-notify");
+const UI_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-ui-notifications-v2");
 const WRAP_MARK = "\uE000";
 const KITTY_IMAGE_PREFIX = "\x1b_G";
 const ITERM2_IMAGE_PREFIX = "\x1b]1337;File=";
@@ -118,7 +118,7 @@ interface SettingsFile {
 	 * "(thinking · ↓ 10 tokens · 2s)" trailer). Defaults to "muted".
 	 */
 	spinnerStatusColor?: string;
-	/** Gray level 0–255 for ├─ └─ │ when branch color mode is `fixed`. */
+	/** Gray level 0–255 for ├ └ │ when branch color mode is `fixed`. */
 	toolBranchRgbGray?: number;
 	/** `fixed` (default): rgb gray 72, theme-independent. `theme`: dim → muted → borderMuted. */
 	toolBranchColorMode?: "theme" | "fixed";
@@ -441,10 +441,10 @@ function isToolExecutionLike(value: unknown): value is { toolName: string; toolC
 	return typeof candidate.toolName === "string" && typeof candidate.toolCallId === "string";
 }
 
-function shouldIndentToolExecution(value: unknown): boolean {
-	if (!value || typeof value !== "object") return false;
-	const toolName = (value as Record<string, unknown>).toolName;
-	return typeof toolName === "string" && ["Agent", "Agents", "get_subagent_result", "steer_subagent"].includes(toolName);
+const AGENT_FAMILY_TOOL_NAMES = new Set(["Agent", "Agents", "get_subagent_result", "steer_subagent"]);
+
+function isAgentFamilyToolName(name: unknown): boolean {
+	return typeof name === "string" && AGENT_FAMILY_TOOL_NAMES.has(name);
 }
 
 function isTerminalImageLine(line: string): boolean {
@@ -490,7 +490,13 @@ type ToolStatus = "pending" | "success" | "error";
 function getToolStatusForGroup(tool: any): ToolStatus {
 	if (tool?.result?.isError) return "error";
 	if (tool?.result && tool?.isPartial !== true) return "success";
-	return "pending";
+	// Only in-flight tools that actually started this agent run count as pending.
+	// History rows reconstructed without a matching toolResult stay isPartial=true
+	// forever; treating them as pending made interrupted tools blink again on resume.
+	if (tool?.isPartial === true && tool?.executionStarted === true && currentAgentWorkStartMs !== undefined) {
+		return "pending";
+	}
+	return "success";
 }
 
 let TOOL_STATUS_SUCCESS = "\x1b[32m";
@@ -540,12 +546,55 @@ function getToolGroupOverallStatus(tools: any[]): ToolStatus {
 	return "success";
 }
 
-function groupStatusLight(status: ToolStatus): string {
+// Claude Code: solid filled circle that is either fully present or fully gone
+// while pending — never a hollow outlined ○. Classic ● + bold is the sweet
+// spot for ordinary tools. Agent-family tools use a breathing size cycle.
+const STATUS_DOT_FILLED = "●";
+const STATUS_DOT_BOLD = "\x1b[1m";
+// Single-cell glyphs only (⬤ is often double-width and walks the baseline).
+// Optical sizes share the same cell so the center stays put while breathing:
+// big ● → medium • → small · → invisible → small · → medium •
+const AGENT_BREATHE_GLYPHS = ["●", "•", "·", " ", "·", "•"] as const;
+const AGENT_BREATHE_LEN = AGENT_BREATHE_GLYPHS.length;
+
+function paintStatusDot(colorAnsi: string): string {
+	return `${colorAnsi}${STATUS_DOT_BOLD}${STATUS_DOT_FILLED}${TRANSPARENT_RESET}`;
+}
+
+function themeStatusDot(theme: Theme, colorKey: "success" | "error" | "dim" | "muted"): string {
+	// theme.fg may not preserve nested SGR cleanly — color the glyph string itself.
+	return theme.fg(colorKey, `${STATUS_DOT_BOLD}${STATUS_DOT_FILLED}`);
+}
+
+function agentBreatheGlyphRaw(): string {
+	// Always exactly one display cell — matches ordinary tool dots, keeps titles aligned.
+	return AGENT_BREATHE_GLYPHS[_globalBlinkPhaseIndex % AGENT_BREATHE_LEN];
+}
+
+function paintAgentBreatheDot(colorAnsi: string = TOOL_STATUS_SUCCESS): string {
+	const glyph = agentBreatheGlyphRaw();
+	if (glyph === " ") return " ";
+	// Bold only on the largest frame so weight changes without shifting the cell.
+	const bold = glyph === "●" ? STATUS_DOT_BOLD : "";
+	return `${colorAnsi}${bold}${glyph}${TRANSPARENT_RESET}`;
+}
+
+function agentBreatheDot(theme: Theme): string {
+	const glyph = agentBreatheGlyphRaw();
+	if (glyph === " ") return " ";
+	const bold = glyph === "●" ? STATUS_DOT_BOLD : "";
+	return theme.fg("success", `${bold}${glyph}`);
+}
+
+function groupStatusLight(status: ToolStatus, options?: { agentBreathe?: boolean }): string {
 	const color = status === "success" ? TOOL_STATUS_SUCCESS : status === "error" ? TOOL_STATUS_ERROR : TOOL_STATUS_PENDING;
 	if (status === "pending") {
-		return isBlinkOn() ? `${TOOL_STATUS_SUCCESS}●${TRANSPARENT_RESET}` : `${TOOL_STATUS_PENDING}○${TRANSPARENT_RESET}`;
+		// Prefer the shared blink phase over wall-clock so group lights stay in sync
+		// with the global timer (and Agent breathe). Space keeps column alignment.
+		if (options?.agentBreathe) return paintAgentBreatheDot(TOOL_STATUS_SUCCESS);
+		return _globalBlinkPhase ? paintStatusDot(TOOL_STATUS_SUCCESS) : " ";
 	}
-	return `${color}●${TRANSPARENT_RESET}`;
+	return paintStatusDot(color);
 }
 
 function formatToolNameList(tools: any[]): string {
@@ -581,7 +630,13 @@ function stripToolChrome(lines: string[]): string[] {
 }
 
 function stripLeadingToolStatus(line: string): string {
-	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)(?:\x1b\[[0-9;]*m)*[●○✗■](?:\x1b\[[0-9;]*m)*\s+/, "$1");
+	// Drop the single-cell status marker so group rows can re-prefix a fresh light.
+	// Include Agent breathe glyphs (·) and the blank off-phase (space) so the title
+	// never keeps a leftover marker that shifts when size changes.
+	return line.replace(
+		/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)(?:\x1b\[[0-9;]*m)*(?:[●○✗■⬤•·]| )(?:\x1b\[[0-9;]*m)*\s+/,
+		"$1",
+	);
 }
 
 function trimAnsiLeft(text: string): string {
@@ -643,29 +698,42 @@ function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: stri
 }
 
 function branchPrefix(index: number, total: number, theme?: Theme): string {
-	const branch = index === total - 1 ? "└─" : "├─";
+	// Bare tee/corner only — no horizontal ─ arm.
+	const branch = index === total - 1 ? "└" : "├";
 	const rule = currentToolBranchAnsi(theme);
 	return ` ${rule}${branch}${TRANSPARENT_RESET} `;
 }
 
 function branchContinuation(index: number, total: number, theme?: Theme): string {
 	const rule = currentToolBranchAnsi(theme);
-	return index === total - 1 ? "    " : ` ${rule}│${TRANSPARENT_RESET}  `;
+	// Match lead width of ` X ` (3 cols of structure + spaces handled outside).
+	return index === total - 1 ? "   " : ` ${rule}│${TRANSPARENT_RESET} `;
 }
 
-function formatBranchedToolLines(lines: string[], index: number, total: number, width: number, status: ToolStatus): string[] {
+function formatBranchedToolLines(
+	lines: string[],
+	index: number,
+	total: number,
+	width: number,
+	status: ToolStatus,
+	options?: { agentBreathe?: boolean },
+): string[] {
 	const output: string[] = [];
 	const content = lines.filter((line) => isTerminalImageLine(line) || stripAnsi(line).trim().length > 0);
 	const safeContent = content.length > 0 ? content : [""];
-	const light = groupStatusLight(status);
+	const light = groupStatusLight(status, options);
 	for (let lineIndex = 0; lineIndex < safeContent.length; lineIndex++) {
 		const line = safeContent[lineIndex];
 		if (isTerminalImageLine(line)) {
 			output.push(line);
 			continue;
 		}
+		// Always strip any leftover status marker from the child call line before
+		// re-prefixing. Agent breathe used · which the old stripper missed, so the
+		// title walked sideways as size changed inside groups.
+		const body = lineIndex === 0 ? removeGroupedToolPrefix(line) : trimAnsiLeft(line);
 		const prefix = lineIndex === 0 ? `${branchPrefix(index, total)}${light} ` : `${branchContinuation(index, total)}  `;
-		output.push(clampLineWidth(`${prefix}${trimAnsiLeft(line)}`, width));
+		output.push(clampLineWidth(`${prefix}${body}`, width));
 	}
 	return output;
 }
@@ -680,51 +748,162 @@ function isGroupableTool(value: unknown): value is InstanceType<typeof ToolExecu
 class ToolGroupComponent extends Container {
 	private tools: any[] = [];
 	private expanded = false;
+	// Memoize full group output. Grouped history is the long-chat bottleneck:
+	// each warm frame used to re-render every child tool, re-branch lines, and
+	// re-clamp every row even when nothing changed.
+	private dirty = true;
+	private cachedWidth?: number;
+	private cachedEpoch?: number;
+	private cachedMode?: string;
+	private cachedExpanded?: boolean;
+	private cachedBlinkPhase?: boolean;
+	private cachedStatusKey?: string;
+	private cachedToolCount?: number;
+	private cachedLines?: string[];
+
+	private clearRenderCache(): void {
+		this.dirty = true;
+		this.cachedWidth = undefined;
+		this.cachedEpoch = undefined;
+		this.cachedMode = undefined;
+		this.cachedExpanded = undefined;
+		this.cachedBlinkPhase = undefined;
+		this.cachedStatusKey = undefined;
+		this.cachedToolCount = undefined;
+		this.cachedLines = undefined;
+	}
+
+	private statusSnapshot(): { key: string; pending: number; success: number; error: number } {
+		// Status counts + per-tool identity/expanded/partial bits detect membership
+		// and completion changes without walking full child render output. Child
+		// content changes still reach us via clearToolRenderCache → invalidate().
+		const counts = countToolStatuses(this.tools);
+		let idBits = "";
+		for (let i = 0; i < this.tools.length; i++) {
+			const tool = this.tools[i];
+			const id = typeof tool?.toolCallId === "string" ? tool.toolCallId : getToolName(tool);
+			const flags = (tool?.isPartial === true ? 1 : 0)
+				| (tool?.result?.isError ? 2 : 0)
+				| (tool?.expanded ? 4 : 0)
+				| (tool?.argsComplete ? 8 : 0)
+				| (tool?.executionStarted ? 16 : 0);
+			idBits += `${id}:${flags},`;
+		}
+		return {
+			key: `${this.tools.length}:${counts.pending}:${counts.success}:${counts.error}:${idBits}`,
+			pending: counts.pending,
+			success: counts.success,
+			error: counts.error,
+		};
+	}
 
 	addTool(tool: any): void {
 		ACTIVE_TOOL_GROUPS.add(this);
 		this.tools.push(tool);
 		tool[COMPONENT_PARENT] = this;
-		this.invalidate();
+		// Don't cascade invalidate into every child — only drop our own cache.
+		// Child tools already rebuild via their own updateDisplay path.
+		this.clearRenderCache();
 	}
 
 	releaseTools(): any[] {
 		const tools = this.tools;
 		this.tools = [];
 		ACTIVE_TOOL_GROUPS.delete(this);
+		this.clearRenderCache();
 		return tools;
 	}
 
 	setExpanded(expanded: boolean): void {
+		if (this.expanded === expanded) return;
 		this.expanded = expanded;
 		for (const tool of this.tools) tool.setExpanded?.(expanded);
-		this.invalidate();
+		this.clearRenderCache();
 	}
 
 	invalidate(): void {
-		for (const tool of this.tools) tool.invalidate?.();
+		// Parent/group invalidation should NOT force every child tool through
+		// updateDisplay() (which re-runs call/result renderers). Drop our memo
+		// only; children keep their own ToolText/TOOL_RENDER_CACHE entries and
+		// recompute only when their content actually changes.
+		this.clearRenderCache();
 	}
 
 	render(width: number): string[] {
 		if (this.tools.length === 0) return [];
 		const safeWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+		// Fast path: settled groups with a valid memo skip ALL child walks.
+		// Child mutations mark dirty via clearToolRenderCache → invalidate().
+		if (
+			!this.dirty
+			&& this.cachedLines
+			&& this.cachedWidth === safeWidth
+			&& this.cachedEpoch === _toolBranchVisualEpoch
+			&& this.cachedMode === toolBackgroundMode
+			&& this.cachedExpanded === this.expanded
+		) {
+			return this.cachedLines;
+		}
+
+		const status = this.statusSnapshot();
+		// Only memoize fully-settled groups. Pending groups must recompute so
+		// blink dots and live partial child content stay fresh. Long chats are
+		// almost entirely settled history, which is the expensive warm path.
+		const canCache = status.pending === 0;
+
 		const groupedName = getGroupedToolName(this.tools);
 		const label = getToolGroupLabel(this.tools);
 		const names = groupedName ? "" : formatToolNameList(this.tools);
-		const light = groupStatusLight(getToolGroupOverallStatus(this.tools));
+		const overall: ToolStatus = status.error > 0 ? "error" : status.pending > 0 ? "pending" : "success";
+		// Group header breathes only when every pending member is Agent-family;
+		// mixed groups keep the ordinary on/off light.
+		const pendingTools = this.tools.filter((tool) => getToolStatusForGroup(tool) === "pending");
+		const headerBreathe = pendingTools.length > 0 && pendingTools.every((tool) => isAgentFamilyToolName(getToolName(tool)));
+		const light = groupStatusLight(overall, { agentBreathe: headerBreathe });
 		const summaryLabel = `${label}:`;
-		const summary = ` ${light} ${summaryLabel} ${formatToolGroupCounts(this.tools)}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${toolOutputDetailHint(undefined as any, this.expanded, true)}`;
+		const countParts: string[] = [];
+		if (status.pending) countParts.push(statusText("pending", status.pending));
+		if (status.success) countParts.push(statusText("success", status.success));
+		if (status.error) countParts.push(statusText("error", status.error));
+		const countsText = countParts.join(`${TRANSPARENT_RESET} • `);
+		const summary = ` ${light} ${summaryLabel} ${countsText}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${toolOutputDetailHint(undefined as any, this.expanded, true)}`;
 		const lines = [" ".repeat(safeWidth), clampLineWidth(summary, safeWidth)];
 		const childWidth = Math.max(1, safeWidth - 6);
+		const total = this.tools.length;
 
-		this.tools.forEach((tool, index) => {
+		for (let index = 0; index < total; index++) {
+			const tool = this.tools[index];
 			const rawLines = this.expanded
 				? getExpandedToolGroupLines(tool, childWidth, groupedName ? label : undefined)
 				: [getCompactToolLine(tool, childWidth, groupedName ? label : undefined)];
-			lines.push(...formatBranchedToolLines(rawLines, index, this.tools.length, safeWidth, getToolStatusForGroup(tool)));
-		});
+			const branched = formatBranchedToolLines(
+				rawLines,
+				index,
+				total,
+				safeWidth,
+				getToolStatusForGroup(tool),
+				{ agentBreathe: isAgentFamilyToolName(getToolName(tool)) },
+			);
+			for (let i = 0; i < branched.length; i++) {
+				lines.push(clampLineWidth(branched[i], safeWidth));
+			}
+		}
 
-		return lines.map((line) => clampLineWidth(line, safeWidth));
+		// Final clamp already applied per-line above; avoid a second full pass.
+		if (canCache) {
+			this.dirty = false;
+			this.cachedWidth = safeWidth;
+			this.cachedEpoch = _toolBranchVisualEpoch;
+			this.cachedMode = toolBackgroundMode;
+			this.cachedExpanded = this.expanded;
+			this.cachedBlinkPhase = true;
+			this.cachedStatusKey = status.key;
+			this.cachedToolCount = total;
+			this.cachedLines = lines;
+		} else {
+			this.clearRenderCache();
+		}
+		return lines;
 	}
 }
 
@@ -824,6 +1003,29 @@ function patchContainerParentTracking(): void {
 	proto[PARENT_TRACKING_PATCH_FLAG] = true;
 }
 
+function formatTodoOverlayLines(lines: string[], width: number): string[] {
+	// Hot path: nearly every Container.render hits this. Bail after the first
+	// non-empty line unless it's actually the Magic Context todo overlay.
+	let firstContent: string | undefined;
+	for (let i = 0; i < lines.length; i++) {
+		const plain = stripAnsi(lines[i]).trim();
+		if (!plain) continue;
+		firstContent = plain;
+		break;
+	}
+	if (!firstContent || !/^[●○]\s+Todos\s+—/.test(firstContent)) return lines;
+	return lines.map((line) => {
+		const plain = stripAnsi(line);
+		if (/^[●○]\s+Todos\s+—/.test(plain)) return clampLineWidth(` ${line}`, width);
+		// Magic Context emits `├─` / `└─` or bare `├` / `└`; strip any arm to bare tee/corner.
+		if (!/^[├└]─?\s+[✓○◐✗●⬤•]\s/.test(plain) && !/^[├└]─?\s+/.test(plain)) return line;
+		const withoutTodoHash = line.replace(/#(?=[A-Za-z0-9_-]+)/, "");
+		const bare = withoutTodoHash.replace(/([├└])─/, "$1");
+		const colored = bare.replace(/[├└]/, (branch) => `${currentToolBranchAnsi()}${branch}${TRANSPARENT_RESET}`);
+		return clampLineWidth(` ${colored}`, width);
+	});
+}
+
 function patchGlobalToolBorders(): void {
 	const proto = Container.prototype as any;
 	if (proto[PATCH_FLAG]) return;
@@ -845,7 +1047,8 @@ function patchGlobalToolBorders(): void {
 
 		const rendered = originalRender.call(this, width);
 		if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
-		if (!isToolExecutionLike(this)) return rendered;
+		const todoOverlay = formatTodoOverlayLines(rendered, width);
+		if (!isToolExecutionLike(this)) return todoOverlay;
 		const branchCache = { branchKey: toolBranchRenderCacheKey(), branchEpoch: _toolBranchVisualEpoch };
 		if (toolBackgroundMode === "default") {
 			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered, ...branchCache };
@@ -863,10 +1066,11 @@ function patchGlobalToolBorders(): void {
 			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered, ...branchCache };
 			return rendered;
 		}
-		const indentTool = shouldIndentToolExecution(this);
+		// Agent-family tools stay column-aligned with every other tool row — no extra
+		// leading indent (the old nested pad made Agent look offset from Read/Bash).
 		const core = textLines.map((line) => {
 			const normalized = normalizeLeadingCheckGlyph(line);
-			return clampLineWidth(stripOuterBackgroundAnsi(indentTool && normalized ? ` ${normalized}` : normalized), width);
+			return clampLineWidth(stripOuterBackgroundAnsi(normalized), width);
 		});
 		const spacerLine = " ".repeat(width);
 		let result: string[];
@@ -944,6 +1148,11 @@ function clearStateKeys(state: Record<string, unknown> | undefined, ...keys: str
 function clearToolRenderCache(value: unknown): void {
 	if (!value || typeof value !== "object") return;
 	delete (value as any)[TOOL_RENDER_CACHE];
+	// If this tool lives inside a ToolGroupComponent, drop the group's memo so
+	// settled headers/counts/child lines can't go stale after a child update.
+	// Only the parent group is touched — we do NOT cascade invalidate siblings.
+	const parent = (value as any)[COMPONENT_PARENT];
+	if (isToolGroupComponent(parent)) parent.invalidate();
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout> | null | undefined): void {
@@ -1092,10 +1301,9 @@ function pluralizeTurns(n: number): string {
 	return `${n} turn${n === 1 ? "" : "s"}`;
 }
 
-const THINKING_ITALIC = "\x1b[3m";
-
 function thinkingSummaryStyledText(body: string): string {
-	return ` ${WORKED_LINE_FG}${THINKING_ITALIC}✻ ${body}${RESET}`;
+	// Preserve the visible thinking text column while omitting ∴ when collapsed.
+	return `   ${WORKED_LINE_FG}${body}${RESET}`;
 }
 
 function thinkingActiveSummaryText(): string {
@@ -1106,7 +1314,7 @@ function thoughtDurationSummaryText(ms: number): string {
 	return thinkingSummaryStyledText(`Thought for ${formatThoughtDuration(ms)}`);
 }
 
-/** Single-line hidden thinking row — no Text paddingX, full muted italic styling. */
+/** Single-line hidden thinking row — no Text paddingX or thinking symbol. */
 class HiddenThinkingSummary {
 	private summaryText: string;
 	private cachedWidth?: number;
@@ -1168,8 +1376,9 @@ function hiddenThinkingSummaryForMessage(message: any): string {
 function isHiddenThinkingPlaceholderText(child: unknown): child is InstanceType<typeof Text> {
 	if (!(child instanceof Text)) return false;
 	const plain = stripAnsi(String((child as any).text ?? "")).trim();
-	if (/^✻\s*Thinking/i.test(plain)) return true;
-	if (/^✻\s*Thought for/i.test(plain)) return true;
+	if (/^[✻∴]\s*Thinking/i.test(plain)) return true;
+	if (/^[✻∴]\s*Thought for/i.test(plain)) return true;
+	if (/^Thought for\b/i.test(plain)) return true;
 	if (/^Thinking\.\.\.$/i.test(plain)) return true;
 	if (/^Thinking…$/i.test(plain)) return true;
 	return /^Thinking:?\s*$/i.test(plain);
@@ -1590,8 +1799,7 @@ class ThinkingParagraph {
 
 	private thinkingMarkdown(): InstanceType<typeof Markdown> {
 		const DIM_FG = WORKED_LINE_FG;
-		const ITALIC = "\x1b[3m";
-		const wrap = (s: string) => `${DIM_FG}${ITALIC}${s}`;
+		const wrap = (s: string) => `${DIM_FG}${s}`;
 		const wrapPlain = (s: string) => wrap(stripAnsi(s));
 		const plainTheme: ConstructorParameters<typeof Markdown>[3] = {
 			heading: wrap,
@@ -1608,11 +1816,11 @@ class ThinkingParagraph {
 			italic: wrap,
 			strikethrough: wrap,
 			underline: wrap,
-			highlightCode: (code: string, _lang?: string) => code.split("\n").map((line) => `${DIM_FG}${ITALIC}${line}`),
+			highlightCode: (code: string, _lang?: string) => code.split("\n").map((line) => `${DIM_FG}${line}`),
 		};
 		const plainStyle: ConstructorParameters<typeof Markdown>[4] = {
-			italic: true,
-			color: (s: string) => `${DIM_FG}${ITALIC}${s}`,
+			italic: false,
+			color: (s: string) => `${DIM_FG}${s}`,
 		};
 		return new Markdown(this.text, 0, 0, plainTheme, plainStyle);
 	}
@@ -1639,9 +1847,9 @@ class ThinkingParagraph {
 			return this.cachedLines;
 		}
 		const md = this.thinkingMarkdown();
-		// " ✻ " = 1 margin + symbol + space = 3 visible chars
+		// " ∴ " = 1 margin + symbol + space = 3 visible chars
 		const PREFIX_W = 3;
-		const prefix = `${WORKED_LINE_FG}✻${RESET}`;
+		const prefix = `${WORKED_LINE_FG}∴${RESET}`;
 		if (safeWidth <= PREFIX_W) {
 			this.cachedWidth = width;
 			this.cachedLines = [clampLineWidth(` ${prefix} `, safeWidth)];
@@ -2021,6 +2229,28 @@ function patchToolExecutionBackgroundSync(): void {
 	proto[TOOL_BG_PATCH_FLAG] = true;
 }
 
+function syncLiveToolRenderState(component: any): void {
+	// updateDisplay paints call header BEFORE result. Pre-seed status + live line
+	// count so the header's blinking ● and `(N lines)` trail stay in sync with
+	// the partial result that is about to render underneath.
+	const state = component?.rendererState;
+	if (!state || typeof state !== "object") return;
+	const ctxLike = {
+		state,
+		isPartial: component?.isPartial === true,
+		executionStarted: component?.executionStarted === true,
+		isError: component?.result?.isError === true,
+	};
+	syncToolCallStatus(ctxLike);
+	if (component?.isPartial === true && component?.result) {
+		const raw = getTextContent(component.result).replace(/\r\n/g, "\n").trimEnd();
+		// tailLimit=0 → count-only (no line materialization) so huge bash tails stay cheap.
+		state._liveLineCount = collectNonEmptyLines(raw, 0).total;
+	} else if (component?.isPartial !== true) {
+		delete state._liveLineCount;
+	}
+}
+
 function patchToolRenderCacheInvalidation(): void {
 	const proto = ToolExecutionComponent.prototype as any;
 	if (proto[TOOL_CACHE_PATCH_FLAG]) return;
@@ -2042,6 +2272,9 @@ function patchToolRenderCacheInvalidation(): void {
 		if (typeof original !== "function") continue;
 		proto[method] = function patchedToolMutation(...args: any[]) {
 			clearToolRenderCache(this);
+			if (method === "updateDisplay" || method === "updateResult" || method === "invalidate") {
+				syncLiveToolRenderState(this);
+			}
 			const result = original.apply(this, args);
 			clearToolRenderCache(this);
 			return result;
@@ -2144,31 +2377,50 @@ function isBlinkOn(): boolean {
 	return Math.floor(Date.now() / 500) % 2 === 0;
 }
 
-function toolHeader(tool: string, summary: string, theme: Theme, prefix = ""): string {
+function toolHeader(tool: string, summary: string, theme: Theme, prefix = "", trailing = ""): string {
 	applyThemePaletteIfNeeded(theme);
 	const label = theme.fg("toolTitle", theme.bold(tool));
-	if (!summary) return `${prefix}${label}`;
-	return `${prefix}${label} ${WRAP_MARK}${theme.fg("accent", summary)}`;
+	const body = summary
+		? `${label} ${WRAP_MARK}${theme.fg("accent", summary)}`
+		: label;
+	return trailing ? `${prefix}${body}${trailing}` : `${prefix}${body}`;
 }
 
-function setToolStatus(ctx: any, status: "pending" | "success" | "error"): void {
-	ctx.state._toolStatus = status;
+function liveLineCountTrailing(ctx: any, theme: Theme): string {
+	if (ctx?.isPartial !== true) return "";
+	const count = ctx?.state?._liveLineCount;
+	if (typeof count !== "number" || !Number.isFinite(count) || count <= 0) return "";
+	return ` ${theme.fg("muted", `(${lineCountLabel(count)})`)}`;
+}
+
+function setToolStatus(ctx: any, status: "pending" | "success" | "error" | "idle"): void {
+	if (ctx?.state) ctx.state._toolStatus = status;
 }
 
 function syncToolCallStatus(ctx: any): void {
 	if (ctx?.isPartial) {
-		// A partial tool row blinks only while an agent is actually running.
-		// When reconstructed from session history (initial load, compaction
-		// rebuild, or /tree navigation to a node ending in a tool call) the
-		// matching tool result lives outside the selected branch, so core never
-		// calls updateResult() and isPartial stays true. With no active agent
-		// that row is settled, not live: aborted calls already carry an isError
-		// result (isPartial=false), so a leftover partial here has succeeded.
-		const live = currentAgentWorkStartMs !== undefined;
-		setToolStatus(ctx, live ? "pending" : "success");
+		// Blink only for tools that actually started in the current agent run.
+		// History rebuilds (resume, compaction, /tree) leave unmatched tool calls
+		// with isPartial=true forever and never set executionStarted — those must
+		// render settled, not keep a pending blink alive across sessions.
+		const agentLive = currentAgentWorkStartMs !== undefined;
+		const started = ctx?.executionStarted === true;
+		if (agentLive && started) {
+			setToolStatus(ctx, "pending");
+			return;
+		}
+		if (agentLive && !started) {
+			// Args still streaming before tool_execution_start — static, no blink.
+			setToolStatus(ctx, "idle");
+			clearBlinkTimer(ctx);
+			return;
+		}
+		setToolStatus(ctx, "success");
+		clearBlinkTimer(ctx);
 		return;
 	}
 	setToolStatus(ctx, ctx.isError ? "error" : "success");
+	clearBlinkTimer(ctx);
 }
 
 function shouldRevealCallArgs(ctx: any): boolean {
@@ -2332,21 +2584,25 @@ function formatRtkRewriteDetails(record: RtkRewriteRecord, theme: Theme): string
 	].join("\n");
 }
 
-function patchRtkRewriteNotifications(ui: any): void {
-	if (!ui || ui[RTK_NOTIFY_PATCH_FLAG]) return;
+function patchUiNotifications(ui: any): void {
+	if (!ui || ui[UI_NOTIFY_PATCH_FLAG]) return;
 	const originalNotify = ui.notify;
 	if (typeof originalNotify !== "function") return;
-	ui.notify = function patchedRtkNotify(message: string, type?: "info" | "warning" | "error") {
+	ui.notify = function patchedUiNotify(message: string, type?: "info" | "warning" | "error") {
 		if (typeof message === "string") {
 			const rewrite = parseRtkRewriteNotice(message);
 			if (rewrite) {
 				rememberRtkRewrite(rewrite);
 				return;
 			}
+			if (message === "💾 Memory auto-reviewed and updated") {
+				applyThemePaletteIfNeeded(ui.theme);
+				message = `${BORDER_COLOR}✻ Memory auto-reviewed and updated${TRANSPARENT_RESET}`;
+			}
 		}
 		return originalNotify.call(this, message, type);
 	};
-	ui[RTK_NOTIFY_PATCH_FLAG] = true;
+	ui[UI_NOTIFY_PATCH_FLAG] = true;
 }
 
 function trackRtkOriginalBashCommand(toolCallId: unknown, args: unknown): void {
@@ -2380,9 +2636,10 @@ function getWriteWasNewFile(ctx: any, cwd: string, filePath: string, reveal = sh
 }
 
 function toolStatusDot(ctx: any, theme: Theme): string {
-	const status = ctx.state?._toolStatus as "pending" | "success" | "error" | undefined;
-	if (status === "success") return `${theme.fg("success", "●")} `;
-	if (status === "error") return `${theme.fg("error", "●")} `;
+	const status = ctx.state?._toolStatus as "pending" | "success" | "error" | "idle" | undefined;
+	if (status === "success") return `${themeStatusDot(theme, "success")} `;
+	if (status === "error") return `${themeStatusDot(theme, "error")} `;
+	if (status === "idle") return `${themeStatusDot(theme, "dim")} `;
 	return `${blinkDot(ctx, theme)} `;
 }
 
@@ -2392,13 +2649,15 @@ function toolStatusDot(ctx: any, theme: Theme): string {
 
 function branchIndent(text: string, continued = false, theme?: Theme): string {
 	const rule = currentToolBranchAnsi(theme);
-	const prefix = continued ? `${rule}│${TRANSPARENT_RESET}  ` : "   ";
+	// Align under bare `├ `/`└ ` (│ + one space, or two spaces when closed).
+	const prefix = continued ? `${rule}│${TRANSPARENT_RESET} ` : "  ";
 	return `${prefix}${WRAP_MARK}${text}`;
 }
 
 function branchLead(text: string, continued = false, theme?: Theme): string {
 	const rule = currentToolBranchAnsi(theme);
-	return `${rule}${continued ? "├─" : "└─"}${TRANSPARENT_RESET} ${WRAP_MARK}${text}`;
+	// Bare tee/corner only — no horizontal ─ arm.
+	return `${rule}${continued ? "├" : "└"}${TRANSPARENT_RESET} ${WRAP_MARK}${text}`;
 }
 
 function withBranch(content: string, theme: Theme, _isError = false, continued = false): string {
@@ -2437,9 +2696,10 @@ function indentBranchBlock(block: string): string {
 
 const MAX_BLINKING_TOOLS = 5;
 const BLINK_INTERVAL_MS = 500;
-// If no streaming event occurs for this long, assume blink entries are leaked
-// (a tool completed without clearing, or the turn ended without turn_end) and
-// stop the re-render storm. Prevents idle TUI crashes and unbounded memory growth.
+// Safety net ONLY for leaked entries after the agent has stopped. Quiet
+// long-running tools (sleep, sparse builds, waiting on network) legitimately
+// emit no tool_execution_update for minutes — treating that silence as "stale"
+// is what made their ● freeze mid-run.
 const BLINK_STALE_TIMEOUT_MS = 15000;
 let _lastBlinkActivity = 0;
 
@@ -2452,6 +2712,9 @@ type BlinkEntry = { key: any; order: number; invalidate: () => void };
 const _blinkContexts = new Map<any, BlinkEntry>();
 let _globalBlinkTimer: ReturnType<typeof setTimeout> | null = null;
 let _blinkOrder = 0;
+// Shared phase for all blinkers. Ordinary tools use even/odd (on/off ●).
+// Agent-family tools map the index onto a 6-step size breath cycle.
+let _globalBlinkPhaseIndex = 0;
 let _globalBlinkPhase = true;
 
 function getBlinkIntervalMs(): number {
@@ -2479,6 +2742,18 @@ function updateBlinkActiveStates(): void {
 	}
 }
 
+function _clearAllBlinkContexts(): void {
+	for (const entry of _blinkContexts.values()) {
+		try { entry.key._blinkActive = false; } catch { /* noop */ }
+	}
+	_blinkContexts.clear();
+	if (_globalBlinkTimer) {
+		clearTimeout(_globalBlinkTimer);
+		_globalBlinkTimer = null;
+	}
+	updateBlinkActiveStates();
+}
+
 function _scheduleGlobalBlinkTimer(): void {
 	if (_globalBlinkTimer) return;
 	const intervalMs = getBlinkIntervalMs();
@@ -2489,18 +2764,17 @@ function _scheduleGlobalBlinkTimer(): void {
 			updateBlinkActiveStates();
 			return;
 		}
-		// Watchdog: if nothing has streamed for a while, the remaining entries are
-		// almost certainly leaked. Clear them and stop re-arming so we don't keep
-		// forcing full TUI re-renders while idle (render-assertion crash / OOM).
-		if (_lastBlinkActivity && Date.now() - _lastBlinkActivity > BLINK_STALE_TIMEOUT_MS) {
-			for (const entry of _blinkContexts.values()) {
-				try { entry.key._blinkActive = false; } catch { /* noop */ }
-			}
-			_blinkContexts.clear();
-			updateBlinkActiveStates();
+		// While an agent run is live, quiet tools are still in flight — keep blinking.
+		// Heartbeat here so sparse/no-output commands never look "stale".
+		if (currentAgentWorkStartMs !== undefined) {
+			markBlinkActivity();
+		} else if (_lastBlinkActivity && Date.now() - _lastBlinkActivity > BLINK_STALE_TIMEOUT_MS) {
+			// Agent already finished; leftover entries are leaks. Stop the re-render storm.
+			_clearAllBlinkContexts();
 			return;
 		}
-		_globalBlinkPhase = !_globalBlinkPhase;
+		_globalBlinkPhaseIndex = (_globalBlinkPhaseIndex + 1) % AGENT_BREATHE_LEN;
+		_globalBlinkPhase = _globalBlinkPhaseIndex % 2 === 0;
 		for (const entry of getBlinkingEntries()) {
 			try { entry.invalidate(); } catch { /* noop */ }
 		}
@@ -2522,12 +2796,18 @@ function setupBlinkTimer(ctx: any): void {
 	const invalidate = typeof ctx?.invalidate === "function" ? () => safeInvalidate(ctx) : () => {};
 	const existing = _blinkContexts.get(key);
 	if (existing) {
-		// Already tracked — just refresh the invalidate fn, skip expensive recalc
+		// Already tracked — refresh invalidate + ensure the global timer is alive.
+		// If a prior watchdog/pass stopped the timer without removing this entry
+		// (or the timer simply died), a quiet long-running tool would otherwise
+		// stay registered forever with a frozen ●.
 		existing.invalidate = invalidate;
+		markBlinkActivity();
+		_scheduleGlobalBlinkTimer();
 		return;
 	}
 	_blinkContexts.set(key, { key, order: ++_blinkOrder, invalidate });
 	key._blinkActive = false;
+	markBlinkActivity();
 	updateBlinkActiveStates();
 	_stopGlobalBlinkTimerIfEmpty();
 	_scheduleGlobalBlinkTimer();
@@ -2549,11 +2829,21 @@ function pendingToolChromeColor(theme: Theme): "dim" | "muted" | "thinkingText" 
 }
 
 function blinkDot(ctx: any, theme: Theme): string {
+	// Only true in-flight tools arm the blink timer. Idle partials (args still
+	// streaming, or history rows left isPartial without a result) stay static.
+	if (ctx?.state?._toolStatus !== "pending") {
+		return themeStatusDot(theme, "dim");
+	}
 	setupBlinkTimer(ctx);
 	const key = getBlinkKey(ctx);
-	const idle = pendingToolChromeColor(theme);
-	if (key?._blinkActive !== true) return theme.fg(idle, "○");
-	return _globalBlinkPhase ? theme.fg("success", "●") : theme.fg(idle, "○");
+	if (key?._blinkActive !== true) return " ";
+	// Agent-family tools breathe through sizes; ordinary tools still on/off ●.
+	if (ctx?.state?._agentBreathe === true) {
+		return agentBreatheDot(theme);
+	}
+	// Claude Code: solid filled circle that either shows or fully disappears —
+	// never a hollow outlined ○ in the off phase.
+	return _globalBlinkPhase ? themeStatusDot(theme, "success") : " ";
 }
 
 // ---------------------------------------------------------------------------
@@ -2637,9 +2927,13 @@ function padToWidth(line: string, width: number): string {
 
 function markedContinuationPrefix(prefix: string): string {
 	const plain = stripAnsi(prefix);
-	const branchMatch = /^(\s*)(?:│  |├─ |└─ )/.exec(plain);
+	// Match bare leads (`├ `/`└ `/`│ `) and legacy armed forms (`├─ `/`└─ `/`│  `).
+	const branchMatch = /^(\s*)(│  |│ |├─ |└─ |├ |└ )/.exec(plain);
 	if (branchMatch) {
-		return `${branchMatch[1]}${currentToolBranchAnsi()}│${TRANSPARENT_RESET}  `;
+		const indent = branchMatch[1];
+		// Keep the same structure width as the lead glyph so wraps stay aligned.
+		const pad = Math.max(0, visibleWidth(branchMatch[2]) - 1);
+		return `${indent}${currentToolBranchAnsi()}│${TRANSPARENT_RESET}${" ".repeat(pad)}`;
 	}
 	return " ".repeat(visibleWidth(prefix));
 }
@@ -2748,12 +3042,26 @@ function collapsedPreviewCount(expanded: boolean, fallback: number): number {
 	return expanded ? expandedPreviewLimit() : fallback;
 }
 
-function buildPreviewText(lines: string[], expanded: boolean, theme: Theme, fallbackCollapsed = 8, totalLineCount = lines.length): string {
+function buildPreviewText(
+	lines: string[],
+	expanded: boolean,
+	theme: Theme,
+	fallbackCollapsed = 8,
+	totalLineCount = lines.length,
+	styleLine?: (line: string) => string,
+): string {
 	if (lines.length === 0 && totalLineCount === 0) return theme.fg("muted", "(no output)");
 	const maxLines = collapsedPreviewCount(expanded, fallbackCollapsed);
-	const shown = lines.slice(0, maxLines);
-	let text = shown.join("\n");
-	const remaining = Math.max(0, totalLineCount - shown.length);
+	// Only style/join the lines we will actually display. Callers used to map
+	// theme.fg over the entire output array first, which scaled with full tool
+	// output even when only 8–10 lines were shown.
+	const limit = Math.min(lines.length, maxLines);
+	let text = "";
+	for (let i = 0; i < limit; i++) {
+		const line = styleLine ? styleLine(lines[i]) : lines[i];
+		text += i === 0 ? line : `\n${line}`;
+	}
+	const remaining = Math.max(0, totalLineCount - limit);
 	if (remaining > 0) {
 		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines${toolOutputDetailHint(theme, expanded, true)})`)}`;
 	}
@@ -3008,7 +3316,7 @@ let FG_DEL = "\x1b[38;2;200;100;100m";
 let FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_LNUM = "\x1b[38;2;100;100;100m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
-// Tool branch connectors (├─ └─ │). Default fixed gray 72 — independent of pi theme.
+// Tool branch connectors (├ └ │). Default fixed gray 72 — independent of pi theme.
 const DEFAULT_TOOL_BRANCH_GRAY = 72;
 
 function toolBranchRgbAnsi(gray: number): string {
@@ -3085,7 +3393,7 @@ function resolveThemeChromeFg(theme: any): string | null {
 	return raw ? attenuateChromeAnsi(raw, theme) : null;
 }
 
-/** Resolve ├─ └─ │ color from settings + theme on every use (not a stale global). */
+/** Resolve ├ └ │ color from settings + theme on every use (not a stale global). */
 let _toolBranchThemeHint: any;
 
 function currentToolBranchAnsi(theme?: any): string {
@@ -3116,10 +3424,10 @@ function applyToolBranchColor(theme?: any): void {
 	syncOutlineChromeFromBranch(theme);
 }
 
-/** Strip baked ├─ └─ │ prefixes so branch color can be reapplied. */
+/** Strip baked ├/└/│ prefixes (short or long arm) so branch color can be reapplied. */
 function stripBranchMarkupLine(line: string): string {
 	let plain = stripAnsi(line);
-	plain = plain.replace(/^\s*[├└]─\s*/, "");
+	plain = plain.replace(/^\s*[├└]─?\s*/, "");
 	plain = plain.replace(/^\s*│\s{0,2}/, "");
 	return plain;
 }
@@ -3390,7 +3698,7 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	const muted = safeFgAnsi(theme, "muted");
 	const dim = safeFgAnsi(theme, "dim") ?? muted;
 
-	// User box, code fences, thinking/thought text, and ├─ └─ │ all follow branch chrome.
+	// User box, code fences, thinking/thought text, and ├ └ │ all follow branch chrome.
 	applyToolBranchColor(theme);
 
 	const chromeFg = BORDER_COLOR;
@@ -4603,6 +4911,10 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 		// message history, so /new starts fresh while /resume picks up past prompts
 		// and the original session start time. Resetting here is what lets /new
 		// clear the totals (Math.min / Math.max seeding alone could never lower them).
+		// Also drop the live-agent marker so history partials rebuilt during resume
+		// never look "in flight" and re-arm blink timers.
+		currentAgentWorkStartMs = undefined;
+		currentAssistantMessageStartMs = undefined;
 		sessionStartMs = undefined;
 		userTurnCount = 0;
 	});
@@ -4677,6 +4989,15 @@ const OPENAI_STYLE_TOOL_NAMES = new Set([
 	"TaskOutput",
 	"TaskStop",
 	"TaskExecute",
+	// Magic Context registers specialized renderers of its own. Re-register its
+	// tools through the public API so they use the same Claude-style rows as
+	// every other external tool handled by this extension.
+	"ctx_search",
+	"ctx_memory",
+	"ctx_note",
+	"ctx_expand",
+	"ctx_reduce",
+	"todowrite",
 ]);
 
 function isMcpToolCandidate(tool: unknown): boolean {
@@ -4715,9 +5036,14 @@ function genericToolLabel(name: string): string {
 function renderGenericToolCall(name: string, args: any, theme: Theme, ctx: any): Text {
 	syncToolCallStatus(ctx);
 	ctx.state._openAiPatchFiles = [];
+	// Agent / subagent tools get a size-breathing pending marker, not on/off ●.
+	if (isAgentFamilyToolName(name)) ctx.state._agentBreathe = true;
 	const sp = (path: string) => shortPath(ctx.cwd ?? process.cwd(), path);
 	const summary = stableCallSummary(ctx, "_callSummary", () => summarizeGenericToolCall(name, args, theme, sp));
-	return makeText(ctx.lastComponent, toolHeader(genericToolLabel(name), summary, theme, toolStatusDot(ctx, theme)));
+	return makeText(
+		ctx.lastComponent,
+		toolHeader(genericToolLabel(name), summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+	);
 }
 
 function renderGenericToolResult(name: string, result: any, options: any, theme: Theme, ctx: any): Text {
@@ -4740,12 +5066,6 @@ function getTextContent(result: any): string {
 		.filter((block: any) => block?.type === "text" && typeof block.text === "string")
 		.map((block: any) => block.text)
 		.join("\n");
-}
-
-function getLivePreviewLines(result: any): string[] {
-	const raw = getTextContent(result).replace(/\r\n/g, "\n").trimEnd();
-	if (!raw) return [];
-	return raw.split("\n").filter((line) => line.trim().length > 0);
 }
 
 function collectNonEmptyLines(text: string, tailLimit?: number): { lines: string[]; total: number } {
@@ -4779,38 +5099,66 @@ function lineCountLabel(count: number): string {
 
 function runningPreviewBlock(
 	result: any,
-	statusText: string,
+	_statusText: string,
 	expanded: boolean,
 	theme: Theme,
 	ctx: any,
 	options: { lines?: string[]; totalLineCount?: number; styleLine?: (line: string) => string; tail?: boolean } = {},
 ): string {
-	setupBlinkTimer(ctx);
+	// Keep the header status dot blinking while partial output streams. Call/result
+	// renderers share rendererState, so setupBlinkTimer here re-arms the same key
+	// the call header uses — but only when this tool actually started executing.
+	syncToolCallStatus(ctx);
+	if (ctx?.state?._toolStatus === "pending") setupBlinkTimer(ctx);
+	else clearBlinkTimer(ctx);
+
 	const limit = liveToolPreviewLimit();
-	if (!liveToolPreviewEnabled() || limit <= 0) {
-		return withBranch(statusText, theme);
+	let lines: string[];
+	let totalLineCount: number;
+	if (options.lines) {
+		lines = options.lines;
+		totalLineCount = options.totalLineCount ?? lines.length;
+	} else {
+		// Single-pass collect; when collapsed only keep the preview window.
+		const raw = getTextContent(result).replace(/\r\n/g, "\n").trimEnd();
+		const collected = collectNonEmptyLines(raw, expanded ? undefined : limit);
+		lines = collected.lines;
+		totalLineCount = collected.total;
 	}
-	const lines = options.lines ?? getLivePreviewLines(result);
-	const totalLineCount = options.totalLineCount ?? lines.length;
-	if (totalLineCount === 0) {
-		return withBranch(statusText, theme);
+	// Line count lives on the tool heading (via liveLineCountTrailing); keep it in
+	// renderer state so the next renderCall pass can pick it up.
+	if (ctx?.state) ctx.state._liveLineCount = totalLineCount;
+
+	if (!liveToolPreviewEnabled() || limit <= 0 || totalLineCount === 0) {
+		// No status row — the blinking ● on the header is the only running indicator.
+		return "";
 	}
 
 	const styleLine = options.styleLine ?? ((line: string) => theme.fg("dim", line || " "));
-	const previewLines = options.tail && !expanded ? lines.slice(-limit) : lines;
-	let preview = buildPreviewText(previewLines.map(styleLine), expanded, theme, limit);
-	if (options.tail && !expanded && totalLineCount > previewLines.length) {
-		preview = `${theme.fg("muted", `... (${totalLineCount - previewLines.length} earlier lines${toolOutputDetailHint(theme, expanded, true)})`)}\n${preview}`;
+	// Prefer pre-collected tail lines; otherwise only take what the preview needs.
+	const previewSource = options.tail && !expanded
+		? (lines.length > limit ? lines.slice(-limit) : lines)
+		: lines;
+	// For tail previews the "earlier lines" prefix owns the remaining count — pass
+	// previewSource.length so buildPreviewText doesn't also append "more lines".
+	const previewTotal = options.tail && !expanded ? previewSource.length : totalLineCount;
+	let preview = buildPreviewText(previewSource, expanded, theme, limit, previewTotal, styleLine);
+	if (options.tail && !expanded && totalLineCount > previewSource.length) {
+		preview = `${theme.fg("muted", `... (${totalLineCount - previewSource.length} earlier lines${toolOutputDetailHint(theme, expanded, true)})`)}\n${preview}`;
 	}
-	return withBranch(`${statusText} ${theme.fg("muted", `(${lineCountLabel(totalLineCount)})`)}\n${preview}`, theme);
+	return withBranch(preview, theme);
 }
 
 function buildPersistentBashPreview(lines: string[], theme: Theme): string {
 	const limit = liveToolPreviewLimit();
 	if (!liveToolPreviewEnabled() || limit <= 0 || lines.length === 0) return "";
-	const shown = lines.slice(-limit).map((line) => theme.fg("dim", line));
-	let preview = shown.join("\n");
-	const earlier = lines.length - shown.length;
+	const start = Math.max(0, lines.length - limit);
+	let preview = "";
+	for (let i = start; i < lines.length; i++) {
+		const styled = theme.fg("dim", lines[i]);
+		preview += i === start ? styled : `\n${styled}`;
+	}
+	const earlier = start;
 	if (earlier > 0) {
 		preview = `${theme.fg("muted", `... (${earlier} earlier lines)`)}\n${preview}`;
 	}
@@ -5173,7 +5521,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	syncToolCallStatus(ctx);
 	const patchText = getStringArg(args, "patchText", "patch_text");
 	const summary = stableCallSummary(ctx, "_callSummary", () => summarizeOpenAiToolCall("apply_patch", args, theme, sp));
-	const hdr = toolHeader("Apply Patch", summary, theme, toolStatusDot(ctx, theme));
+	const hdr = toolHeader("Apply Patch", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
 
 	if (!ctx.argsComplete) return makeText(ctx.lastComponent, hdr);
 	const preview = getCachedApplyPatchPreview(patchText, sp, ctx);
@@ -5303,7 +5651,14 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 	const statusText = ctx.isError ? theme.fg("error", lines[0]) : theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`);
 	if (mode === "summary") return makeText(ctx.lastComponent, withBranch(statusText, theme));
 	if (!expanded) return makeText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
-	const preview = buildPreviewText(lines.map((line) => theme.fg(ctx.isError ? "error" : "toolOutput", line || " ")), true, theme, previewLimit());
+	const preview = buildPreviewText(
+		lines,
+		true,
+		theme,
+		previewLimit(),
+		lines.length,
+		(line) => theme.fg(ctx.isError ? "error" : "toolOutput", line || " "),
+	);
 	return makeText(ctx.lastComponent, withBranch(`${statusText}\n${preview}`, theme));
 }
 
@@ -5460,7 +5815,9 @@ function formatOpenAiSuccessLine(name: string, line: string, theme: Theme): stri
 function renderTaskListResult(lines: string[], expanded: boolean, theme: Theme, ctx: any): Text {
 	const tasks = lines.map(parseTaskListLine).filter((task): task is ParsedTaskListLine => task !== null);
 	if (tasks.length === 0) {
-		const text = lines.length === 0 ? theme.fg("muted", "no tasks") : buildPreviewText(lines.map((line) => theme.fg("dim", line)), expanded, theme, previewLimit());
+		const text = lines.length === 0
+			? theme.fg("muted", "no tasks")
+			: buildPreviewText(lines, expanded, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line));
 		return makeText(ctx.lastComponent, withBranch(text, theme));
 	}
 
@@ -5560,7 +5917,14 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 
 	const preview = lines.length === 1
 		? theme.fg(ctx.isError ? "error" : "dim", lines[0])
-		: buildPreviewText(lines.map((line) => theme.fg(ctx.isError ? "error" : "dim", line || " ")), true, theme, previewLimit());
+		: buildPreviewText(
+			lines,
+			true,
+			theme,
+			previewLimit(),
+			lines.length,
+			(line) => theme.fg(ctx.isError ? "error" : "dim", line || " "),
+		);
 	return makeText(ctx.lastComponent, withBranch(`${statusText}\n${preview}`, theme));
 }
 
@@ -5643,7 +6007,7 @@ export default function (pi: ExtensionAPI) {
 						description:
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
-							: m === "branch" ? "├─ └─ │ gray (0-255), theme, fixed, or reset"
+							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
 							: m === "user" ? "Set user prompt style"
 							: m === "code-border" ? "Toggle assistant code fence borders"
 							: m === "status" ? "Show tool UI settings"
@@ -5986,7 +6350,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		clearRtkRewriteState();
 		if (!ctx.hasUI) return;
-		patchRtkRewriteNotifications(ctx.ui);
+		patchUiNotifications(ctx.ui);
 		// Session switch (/resume, /new) can leave tool chrome from the previous
 		// theme; rebind from ctx.ui.theme (other extensions may setTheme in the
 		// same tick — deferred passes pick up the final theme without coupling).
@@ -6002,7 +6366,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("turn_start", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
-		patchRtkRewriteNotifications(ctx.ui);
+		patchUiNotifications(ctx.ui);
 		applyToolBackgroundMode(ctx.ui.theme);
 		applyThemePaletteIfNeeded(ctx.ui.theme);
 	});
@@ -6042,7 +6406,7 @@ export default function (pi: ExtensionAPI) {
 				const line =
 					theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
 					theme.fg("customMessageText", skillName);
-				return makeText(ctx.lastComponent, `${toolStatusDot(ctx, theme)}${line}`);
+				return makeText(ctx.lastComponent, `${toolStatusDot(ctx, theme)}${line}${liveLineCountTrailing(ctx, theme)}`);
 			}
 			const summary = stableCallSummary(ctx, "_callSummary", () => {
 				let value = sp(args.path ?? "");
@@ -6054,7 +6418,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				return value;
 			});
-			return makeText(ctx.lastComponent, toolHeader("Read", summary, theme, toolStatusDot(ctx, theme)));
+			return makeText(
+				ctx.lastComponent,
+				toolHeader("Read", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -6070,8 +6437,7 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${lines.length} lines loaded`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
-			const shown = lines.slice(0, previewLimit());
-			text += `\n${buildPreviewText(shown.map((line) => theme.fg("dim", line || " ")), false, theme, previewLimit())}`;
+			text += `\n${buildPreviewText(lines, false, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line || " "))}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
 	});
@@ -6090,7 +6456,10 @@ export default function (pi: ExtensionAPI) {
 			const rewrite = ensureRtkRewriteForContext(ctx, args);
 			const summary = stableCallSummary(ctx, "_callSummary", () => summarizeText(args.command, 72));
 			const rtkBadge = rewrite ? theme.fg("muted", " (RTK)") : "";
-			return makeText(ctx.lastComponent, toolHeader("Bash", `${summary}${rtkBadge}`, theme, toolStatusDot(ctx, theme)));
+			return makeText(
+				ctx.lastComponent,
+				toolHeader("Bash", `${summary}${rtkBadge}`, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			const details = result.details as BashToolDetails | undefined;
@@ -6098,34 +6467,38 @@ export default function (pi: ExtensionAPI) {
 			const output = result.content[0]?.type === "text" ? result.content[0].text : "";
 			if (isPartial) {
 				const preview = collectNonEmptyLines(output, expanded ? undefined : liveToolPreviewLimit());
-				const running = runningPreviewBlock(result, theme.fg("warning", "Running..."), expanded, theme, ctx, {
+				const running = runningPreviewBlock(result, "", expanded, theme, ctx, {
 					lines: preview.lines,
 					totalLineCount: preview.total,
 					styleLine: (line) => theme.fg("dim", line),
 					tail: true,
 				});
-				const withRewrite = expanded && rewrite ? `${running}\n${withBranch(formatRtkRewriteDetails(rewrite, theme), theme)}` : running;
+				const withRewrite = expanded && rewrite
+					? [running, withBranch(formatRtkRewriteDetails(rewrite, theme), theme)].filter(Boolean).join("\n")
+					: running;
 				return makeText(ctx.lastComponent, withRewrite);
 			}
-			const nonEmpty = collectNonEmptyLines(output).lines;
+			// Collapsed: only keep the live-preview tail (or nothing). Expanded: full list.
+			const keepTail = !expanded && liveToolPreviewEnabled() ? liveToolPreviewLimit() : undefined;
+			const nonEmpty = collectNonEmptyLines(output, expanded ? undefined : (keepTail ?? 0));
 			clearBlinkTimer(ctx);
 			setToolStatus(ctx, ctx.isError ? "error" : "success");
-			if (nonEmpty.length > 0 && ctx.state?._bashPreviewReleased !== true) {
+			if (nonEmpty.total > 0 && ctx.state?._bashPreviewReleased !== true) {
 				preserveBashPreview(ctx);
 				if (ctx.state) ctx.state._bashPreviewReleased = true;
 			}
 			const exitMatch = output.match(/exit code: (\d+)/);
 			const exitCode = exitMatch ? Number.parseInt(exitMatch[1], 10) : null;
 			let text = exitCode === null || exitCode === 0 ? theme.fg("success", "Done") : theme.fg("error", `Exit ${exitCode}`);
-			text += theme.fg("muted", ` (${nonEmpty.length} lines)`);
+			text += theme.fg("muted", ` (${nonEmpty.total} lines)`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " [truncated]");
-			const persistentPreview = shouldPreserveBashPreview(ctx) ? buildPersistentBashPreview(nonEmpty, theme) : "";
+			const persistentPreview = shouldPreserveBashPreview(ctx) ? buildPersistentBashPreview(nonEmpty.lines, theme) : "";
 			if (!expanded && persistentPreview) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}\n${persistentPreview}`, theme));
-			if (!expanded && nonEmpty.length > 0) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
+			if (!expanded && nonEmpty.total > 0) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(text, theme));
 			const collapsed = bashCollapsedLimit();
 			if (rewrite) text += `\n${formatRtkRewriteDetails(rewrite, theme)}`;
-			text += `\n${buildPreviewText(nonEmpty.map((line) => theme.fg("dim", line)), false, theme, collapsed)}`;
+			text += `\n${buildPreviewText(nonEmpty.lines, false, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line))}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
 	});
@@ -6146,7 +6519,10 @@ export default function (pi: ExtensionAPI) {
 				if (args.path) value += ` in ${args.path}`;
 				return value;
 			});
-			return makeText(ctx.lastComponent, toolHeader("Grep", summary, theme, toolStatusDot(ctx, theme)));
+			return makeText(
+				ctx.lastComponent,
+				toolHeader("Grep", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -6162,7 +6538,7 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${matches.length} matches`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
-			text += `\n${buildPreviewText(matches.map((line) => theme.fg("dim", line)), false, theme, previewLimit())}`;
+			text += `\n${buildPreviewText(matches, false, theme, previewLimit(), matches.length, (line) => theme.fg("dim", line))}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
 	});
@@ -6183,7 +6559,10 @@ export default function (pi: ExtensionAPI) {
 				if (args.path) value += ` in ${args.path}`;
 				return value;
 			});
-			return makeText(ctx.lastComponent, toolHeader("Find", summary, theme, toolStatusDot(ctx, theme)));
+			return makeText(
+				ctx.lastComponent,
+				toolHeader("Find", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -6227,7 +6606,10 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme, ctx) {
 			syncToolCallStatus(ctx);
 			const summary = stableCallSummary(ctx, "_callSummary", () => sp(args.path ?? "."));
-			return makeText(ctx.lastComponent, toolHeader("List", summary, theme, toolStatusDot(ctx, theme)));
+			return makeText(
+				ctx.lastComponent,
+				toolHeader("List", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -6302,12 +6684,12 @@ export default function (pi: ExtensionAPI) {
 				const base = sp(fp);
 				return shouldRevealCallArgs(ctx) ? `${base} ${theme.fg("muted", `(${lineCount(args.content ?? "")} lines)`)}` : base;
 			}, revealSummary);
-			const hdr = toolHeader(label, summary, theme, toolStatusDot(ctx, theme));
+			const hdr = toolHeader(label, summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
 			return makeText(ctx.lastComponent, hdr);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
-				return makeText(ctx.lastComponent, runningPreviewBlock(result, theme.fg("dim", "Writing..."), expanded, theme, ctx));
+				return makeText(ctx.lastComponent, runningPreviewBlock(result, "", expanded, theme, ctx));
 			}
 			clearBlinkTimer(ctx);
 			setToolStatus(ctx, ctx.isError ? "error" : "success");
@@ -6425,7 +6807,7 @@ export default function (pi: ExtensionAPI) {
 			const revealSummary = shouldRevealCallArgs(ctx) || (!!fp && hasOwnArg(args, "edits"));
 			const summary = stableCallSummary(ctx, "_callSummary", () => shouldRevealCallArgs(ctx) && operations.length > 1 ? `${sp(fp)} ${theme.fg("muted", `(${operations.length} edits)`)}` : sp(fp), revealSummary);
 			syncToolCallStatus(ctx);
-			const hdr = toolHeader("Edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`);
+			const hdr = toolHeader("Edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`, liveLineCountTrailing(ctx, theme));
 			if (!(ctx.argsComplete && operations.length > 0)) return makeText(ctx.lastComponent, hdr);
 			const diffWidth = branchDiffWidth();
 			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
@@ -6511,7 +6893,10 @@ export default function (pi: ExtensionAPI) {
 					syncToolCallStatus(ctx);
 					ctx.state._openAiPatchFiles = [];
 					const summary = stableCallSummary(ctx, "_callSummary", () => summarizeOpenAiToolCall(name, args, theme, sp));
-					return makeText(ctx.lastComponent, toolHeader(label, summary, theme, toolStatusDot(ctx, theme)));
+					return makeText(
+						ctx.lastComponent,
+						toolHeader(label, summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+					);
 				},
 				renderResult(result: any, { expanded, isPartial }: any, theme: Theme, ctx: any) {
 					if (name === "apply_patch") return renderApplyPatchResult(result, isPartial, theme, ctx);
@@ -6568,48 +6953,40 @@ export default function (pi: ExtensionAPI) {
 		registerMcpToolOverrides();
 	});
 
-	// Streaming activity keeps the blink timer alive; agent_end clears leaked
-	// entries so the re-render loop can't keep running while idle.
+	// Streaming activity keeps the blink timer alive. Do NOT clear blink contexts
+	// on turn_end — a turn ends when the assistant message finishes, BEFORE its
+	// tools run. agent_end / agent_settled are the real "work finished" signals.
 	pi.on("turn_start", async () => { markBlinkActivity(); });
 	pi.on("message_start", async () => { markBlinkActivity(); });
 	pi.on("message_update", async () => { markBlinkActivity(); });
 	pi.on("tool_execution_start", async () => { markBlinkActivity(); });
+	// Partial tool output is the main long-running signal (bash streams for minutes).
+	pi.on("tool_execution_update", async () => { markBlinkActivity(); });
+	pi.on("tool_execution_end", async () => { markBlinkActivity(); });
+	// agent_end fires when a low-level run finishes (tools for that assistant message
+	// are done). registerThinkingLabels clears currentAgentWorkStartMs on the same
+	// event; defer so we only wipe blink state once the work marker is gone.
+	// Do not use agent_settled here — older peer types don't include it, and the
+	// live-agent heartbeat already keeps quiet long tools blinking until agent_end.
 	pi.on("agent_end", async () => {
-		markBlinkActivity();
-		for (const entry of _blinkContexts.values()) {
-			entry.key._blinkActive = false;
-		}
-		_blinkContexts.clear();
-		if (_globalBlinkTimer) {
-			clearTimeout(_globalBlinkTimer);
-			_globalBlinkTimer = null;
-		}
+		queueMicrotask(() => {
+			if (currentAgentWorkStartMs !== undefined) {
+				markBlinkActivity();
+				return;
+			}
+			_clearAllBlinkContexts();
+		});
 	});
-
-	// Safety net: clear all blink timers on turn/session boundaries
-	pi.on("turn_end", async () => {
-		for (const entry of _blinkContexts.values()) {
-			entry.key._blinkActive = false;
-		}
-		_blinkContexts.clear();
-		clearHighlightCache();
-		if (_globalBlinkTimer) {
-			clearTimeout(_globalBlinkTimer);
-			_globalBlinkTimer = null;
-		}
+	// Session rebuild (resume/reload/fork) must not leave history partials blinking.
+	pi.on("session_start", async () => {
+		_clearAllBlinkContexts();
 	});
 	pi.on("session_shutdown", async () => {
-		for (const entry of _blinkContexts.values()) {
-			entry.key._blinkActive = false;
-		}
-		_blinkContexts.clear();
+		_clearAllBlinkContexts();
 		clearRtkRewriteState();
+		WRITE_EXISTED_BEFORE.clear();
 		clearHighlightCache();
 		invalidateThemePaletteCache();
 		bumpToolBranchVisualEpoch();
-		if (_globalBlinkTimer) {
-			clearTimeout(_globalBlinkTimer);
-			_globalBlinkTimer = null;
-		}
 	});
 }

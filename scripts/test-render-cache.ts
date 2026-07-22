@@ -6,14 +6,28 @@ initTheme("dark", false);
 
 // Load the extension onto a fake pi so the render patches apply.
 const fakePi = {
-	tools: new Map(), commands: new Map(),
+	tools: new Map(), commands: new Map(), handlers: new Map<string, any[]>(),
 	registerTool(d: any) { this.tools.set(d.name, d); },
 	registerCommand(n: string, c: any) { this.commands.set(n, c); },
 	registerShortcut(_k: string, _s: any) {},
-	on(_n: string, _h: any) {},
+	on(n: string, h: any) { this.handlers.set(n, [...(this.handlers.get(n) ?? []), h]); },
 	getThinkingLevel() { return "off"; },
 	getAllTools() { return [...this.tools.values()]; },
 };
+const magicContextToolNames = ["ctx_search", "ctx_memory", "ctx_note", "ctx_expand", "ctx_reduce", "todowrite"];
+const oldMagicRenderCall = () => new Container();
+const oldMagicRenderResult = () => new Container();
+for (const name of magicContextToolNames) {
+	fakePi.registerTool({
+		name,
+		label: name,
+		description: `${name} test tool`,
+		parameters: {},
+		execute: async (_id: string, params: any) => ({ content: [{ type: "text", text: `${name}:${params.value}` }] }),
+		renderCall: oldMagicRenderCall,
+		renderResult: oldMagicRenderResult,
+	});
+}
 const ext = await import("../extensions/index.ts");
 ext.default(fakePi as any);
 
@@ -119,7 +133,7 @@ const neq = (a: string[], b: string[], label: string) => {
 		if (!ccTools) throw new Error("cc-tools command not registered");
 		const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded() { return false; }, setToolsExpanded() {} } } as any;
 		const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-		// A full-width rule line (borderLine) is all '─' chars; branch connectors '└─' are not.
+		// A full-width rule line (borderLine) is all '─' chars; branch connectors '└' are not.
 		const hasFullWidthRule = (lines: string[]) =>
 			lines.some((l) => { const p = stripAnsi(l); return /^─+$/.test(p) && p.length > 5; });
 
@@ -153,6 +167,71 @@ const neq = (a: string[], b: string[], label: string) => {
 		process.env.HOME = realHome;
 		fs.rmSync(tmpHome, { recursive: true, force: true });
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 6. Magic Context tool definitions are re-registered with local renderers.
+// ---------------------------------------------------------------------------
+{
+	const sessionStartHandlers = (fakePi as any).handlers.get("session_start") ?? [];
+	if (sessionStartHandlers.length === 0) throw new Error("session_start handler not registered");
+	for (const handler of sessionStartHandlers) await handler({}, { hasUI: false });
+	for (const name of magicContextToolNames) {
+		const tool = (fakePi as any).tools.get(name);
+		if (!tool) throw new Error(`${name} was not preserved during override registration`);
+		if (tool.renderCall === oldMagicRenderCall || tool.renderResult === oldMagicRenderResult) {
+			throw new Error(`${name} kept its old Magic Context renderer`);
+		}
+		const result = await tool.execute("test", { value: "ok" }, undefined, undefined, {});
+		if (result.content?.[0]?.text !== `${name}:ok`) throw new Error(`${name} execute behavior changed`);
+	}
+	console.log("OK  Magic Context tools: local renderers replace extension defaults");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Magic Context todo overlay receives local branch chrome and one indent.
+// ---------------------------------------------------------------------------
+{
+	const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+	const widget = new Container();
+	widget.addChild({
+		render: () => [
+			theme.fg("accent", "● Todos — 1/2 completed"),
+			`${theme.fg("dim", "├─")} ${theme.fg("success", "✓")} #done Done`,
+			`${theme.fg("dim", "└─")} ${theme.fg("warning", "◐")} #next Next`,
+		],
+		invalidate() {},
+	} as any);
+	const lines = widget.render(W);
+	const plain = lines.map(stripAnsi);
+	if (plain[0] !== " ● Todos — 1/2 completed") throw new Error("todo overlay heading did not gain one indent");
+	if (plain[1] !== " ├ ✓ done Done" || plain[2] !== " └ ◐ next Next") {
+		throw new Error("todo overlay branch rows did not strip arm, indent, and remove todo ID hashes");
+	}
+	if (!lines[1].includes("\x1b[38;")) throw new Error("todo overlay branch did not receive branch chrome");
+	console.log("OK  todo overlay: branch chrome + one indent");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Hermes auto-review notice is restyled locally without changing Hermes.
+// ---------------------------------------------------------------------------
+{
+	const notices: string[] = [];
+	const ui = {
+		theme,
+		notify(message: string) { notices.push(message); },
+		getToolsExpanded() { return false; },
+		setToolsExpanded() {},
+	};
+	const turnStart = (fakePi as any).handlers.get("turn_start")?.[0];
+	if (!turnStart) throw new Error("turn_start handler not registered");
+	await turnStart({}, { hasUI: true, ui });
+	ui.notify("💾 Memory auto-reviewed and updated");
+	const notice = notices.at(-1) ?? "";
+	if (!notice.includes("✻ Memory auto-reviewed and updated") || !notice.includes("\x1b[38;") || notice.includes("\x1b[2m")) {
+		throw new Error("Hermes auto-review notice did not adopt thinking-text color without extra dimming");
+	}
+	console.log("OK  Hermes notice: thinking-text color without extra dimming");
 }
 
 console.log("\nAll correctness checks passed.");
