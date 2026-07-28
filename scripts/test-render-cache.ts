@@ -97,7 +97,7 @@ const neq = (a: string[], b: string[], label: string) => {
 // ---------------------------------------------------------------------------
 {
 	const width = 28;
-	const c = new UserMessageComponent("First **Markdown** line wraps for alignment.\n\nSecond line.");
+	const c = new UserMessageComponent("First **Markdown** line wraps for alignment.\n\nSecond line.\n\n- Bullet item");
 	const a = c.render(width);
 	const b = c.render(width);
 	eq(b, a, "user: warm cache hit must equal cold render");
@@ -110,6 +110,9 @@ const neq = (a: string[], b: string[], label: string) => {
 	}
 	if (!plain.some((line) => line.includes("First Markdown")) || !plain.some((line) => line.includes("Second line."))) {
 		throw new Error("user: rendered Markdown text was lost");
+	}
+	if (!plain.some((line) => line.includes("- Bullet item")) || plain.some((line) => line.includes("◉"))) {
+		throw new Error("user: unordered list marker was replaced");
 	}
 	if (!plain[0].startsWith(" ❯ ") || plain.slice(1).some((line) => line.trim() && !line.startsWith("   "))) {
 		throw new Error("user: prompt marker or continuation alignment is incorrect");
