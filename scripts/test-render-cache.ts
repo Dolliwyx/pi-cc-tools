@@ -71,7 +71,29 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 2. User message: immutable content → deterministic across renders.
+// 2. Fenced code retains only its rendered code, without box chrome or labels.
+// ---------------------------------------------------------------------------
+{
+	const msg = {
+		role: "assistant",
+		content: [{ type: "text", text: "**Markdown stays**\n\n```typescript\nconst highlightedCode = true;\n```\n\n```text\nplain fence\n```" }],
+		stopReason: "end_turn",
+	};
+	const plain = new AssistantMessageComponent(msg as any, false)
+		.render(W)
+		.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+		.join("\n");
+	if (!plain.includes("Markdown stays") || !plain.includes("const highlightedCode = true;") || !plain.includes("plain fence")) {
+		throw new Error("fenced code or non-code Markdown was lost");
+	}
+	if (plain.includes("```") || plain.includes("typescript") || /[╭╮╰╯]/.test(plain)) {
+		throw new Error("fenced code still has fence markers, a language label, or box chrome");
+	}
+	console.log("OK  fenced code: code only, no box chrome or language label");
+}
+
+// ---------------------------------------------------------------------------
+// 3. User message: immutable content → deterministic across renders.
 // ---------------------------------------------------------------------------
 {
 	const c = new UserMessageComponent("User asks a question with **bold** and `code`.");
@@ -82,7 +104,7 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Custom message: rebuild() invalidates.
+// 4. Custom message: rebuild() invalidates.
 // ---------------------------------------------------------------------------
 {
 	const message = { customType: "subagent-notification", content: "✓ Done\n⎿ transcript: foo" };
@@ -100,7 +122,7 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Parent Container.render must NOT mutate the cached child array.
+// 5. Parent Container.render must NOT mutate the cached child array.
 //    Render child, capture cached ref, wrap in a parent, render parent, then
 //    re-render child and confirm the cached array is unchanged.
 // ---------------------------------------------------------------------------
@@ -118,7 +140,7 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Custom (subagent) message framing follows toolBackgroundMode. Switching
+// 6. Custom (subagent) message framing follows toolBackgroundMode. Switching
 //    mode must invalidate the cached framing. Uses an isolated temp HOME so the
 //    real ~/.pi/settings.json is never touched.
 // ---------------------------------------------------------------------------
@@ -170,7 +192,7 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Magic Context tool definitions are re-registered with local renderers.
+// 7. Magic Context tool definitions are re-registered with local renderers.
 // ---------------------------------------------------------------------------
 {
 	const sessionStartHandlers = (fakePi as any).handlers.get("session_start") ?? [];
@@ -189,7 +211,7 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Magic Context todo overlay receives local branch chrome and one indent.
+// 8. Magic Context todo overlay receives local branch chrome and one indent.
 // ---------------------------------------------------------------------------
 {
 	const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
@@ -213,7 +235,7 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Hermes auto-review notice is restyled locally without changing Hermes.
+// 9. Hermes auto-review notice is restyled locally without changing Hermes.
 // ---------------------------------------------------------------------------
 {
 	const notices: string[] = [];

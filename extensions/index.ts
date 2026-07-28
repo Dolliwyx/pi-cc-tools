@@ -48,11 +48,9 @@ const RESET = "\x1b[0m";
 const TRANSPARENT_BG = "\x1b[49m";
 const TRANSPARENT_RESET = `${RESET}${TRANSPARENT_BG}`;
 
-// User/code box borders and thinking/thought text: branch color + OUTLINE_CHROME_BRIGHTEN.
+// User box borders and thinking/thought text: branch color + OUTLINE_CHROME_BRIGHTEN.
 // Branch ├└│ stay at `currentToolBranchAnsi` (see syncOutlineChromeFromBranch).
 let BORDER_COLOR = "\x1b[38;5;238m";
-let CODE_BLOCK_LANG_FG = "\x1b[38;2;95;95;95m";
-const CHROME_ITALIC = "\x1b[3m";
 /** Lift outline chrome above branch connectors so boxes and thought read brighter. */
 const OUTLINE_CHROME_BRIGHTEN = 64;
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
@@ -225,26 +223,11 @@ function stripRenderedHeadingMarkers(line: string): string {
 	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t])*)#{3,6}[ \t]*((?:\x1b\[[0-9;]*m)*)/, "$1$2");
 }
 
-const PLAIN_FENCE_LANGS = new Set(["text", "txt", "plain", "plaintext", ""]);
-
-function parseRenderedFenceLine(line: string): { kind: "open" | "close"; language: string } | undefined {
+function parseRenderedFenceLine(line: string): "open" | "close" | undefined {
 	const plain = stripAnsi(line).trim();
-	if (plain === "```") return { kind: "close", language: "" };
+	if (plain === "```") return "close";
 	if (!plain.startsWith("```")) return undefined;
-	const rest = plain.slice(3).trim();
-	if (rest.includes("`")) return undefined;
-	return { kind: "open", language: rest };
-}
-
-function formatCodeBlockLanguageLabel(language: string): string {
-	const raw = language.trim();
-	if (!raw) return "";
-	return raw.toLowerCase();
-}
-
-function mutedDotFill(count: number): string {
-	if (count <= 0) return "";
-	return `${BORDER_COLOR}${"·".repeat(count)}${TRANSPARENT_RESET}`;
+	return plain.slice(3).trim().includes("`") ? undefined : "open";
 }
 
 function padRenderedLineToWidth(line: string, width: number): string {
@@ -253,15 +236,6 @@ function padRenderedLineToWidth(line: string, width: number): string {
 	const gap = ceiling - visibleWidth(line);
 	if (gap <= 0) return line;
 	return line + " ".repeat(gap);
-}
-
-function isCodeBoxChromeLine(line: string): boolean {
-	const plain = stripAnsi(line).trim();
-	if (!plain) return false;
-	if (/^[╭╮╰╯│·\s]+$/.test(plain) && /[╭╮╰╯│]/.test(plain)) return true;
-	if (/^╭/.test(plain) && /╮$/.test(plain)) return true;
-	if (/^╰/.test(plain) && /╯$/.test(plain)) return true;
-	return false;
 }
 
 function isUserMessageChromeLine(line: string): boolean {
@@ -316,7 +290,7 @@ function applyTerminalCopyZones(lines: string[]): string[] {
 }
 
 function isCopyExcludedChromeLine(line: string): boolean {
-	return isCodeBoxChromeLine(line) || isUserMessageChromeLine(line);
+	return isUserMessageChromeLine(line);
 }
 
 function copyPayloadForLine(line: string): string | undefined {
@@ -327,80 +301,11 @@ function copyPayloadForLine(line: string): string | undefined {
 	return plain;
 }
 
-function roundedCodeBlockTop(width: number, language: string): string {
-	if (width <= 1) return `${BORDER_COLOR}│${TRANSPARENT_RESET}`;
-	const label = formatCodeBlockLanguageLabel(language);
-	if (!label || width < 8) {
-		const inner = Math.max(0, width - 2);
-		return `${BORDER_COLOR}╭${TRANSPARENT_RESET}${mutedDotFill(inner)}${BORDER_COLOR}╮${TRANSPARENT_RESET}`;
-	}
-	const labelStyled = `${CODE_BLOCK_LANG_FG}${CHROME_ITALIC}${label}${RESET}${TRANSPARENT_RESET}`;
-	const labelW = visibleWidth(labelStyled);
-	const dotCount = Math.max(0, width - 6 - labelW);
-	return `${BORDER_COLOR}╭· ${TRANSPARENT_RESET}${labelStyled} ${mutedDotFill(dotCount)}${BORDER_COLOR} ╮${TRANSPARENT_RESET}`;
-}
-
-function roundedCodeBlockBottom(width: number): string {
-	if (width <= 1) return `${BORDER_COLOR}│${TRANSPARENT_RESET}`;
-	const inner = Math.max(0, width - 2);
-	return `${BORDER_COLOR}╰${TRANSPARENT_RESET}${mutedDotFill(inner)}${BORDER_COLOR}╯${TRANSPARENT_RESET}`;
-}
-
-function borderedCodeBlockLine(line: string, width: number): string {
-	const innerWidth = Math.max(1, width - 4);
-	let content = line;
-	if (visibleWidth(content) > innerWidth) {
-		content = truncateToWidth(content, innerWidth, "", false);
-	}
-	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-	return `${BORDER_COLOR}│${TRANSPARENT_RESET} ${content}${padding} ${BORDER_COLOR}│${TRANSPARENT_RESET}`;
-}
-
-function boxRenderedCodeBlock(bodyLines: string[], language: string, width: number): string[] {
-	const safeWidth = Math.max(4, Number.isFinite(width) ? Math.floor(width) : 0);
-	const framed = [
-		roundedCodeBlockTop(safeWidth, language),
-		...bodyLines.map((line) => borderedCodeBlockLine(line, safeWidth)),
-		roundedCodeBlockBottom(safeWidth),
-	];
-	return framed.map((line) => padRenderedLineToWidth(line, safeWidth));
-}
-
-function sanitizeRenderedTextBlockLines(lines: string[], width?: number): string[] {
+function sanitizeRenderedTextBlockLines(lines: string[]): string[] {
 	const result: string[] = [];
-	let i = 0;
-	const canBox = typeof width === "number" && width > 0;
-	while (i < lines.length) {
-		const fence = parseRenderedFenceLine(lines[i]);
-		if (fence?.kind === "open") {
-			const language = fence.language;
-			const hideBox = PLAIN_FENCE_LANGS.has(language.trim().toLowerCase());
-			const body: string[] = [];
-			i++;
-			while (i < lines.length) {
-				const close = parseRenderedFenceLine(lines[i]);
-				if (close?.kind === "close") {
-					i++;
-					break;
-				}
-				body.push(lines[i]);
-				i++;
-			}
-			if (hideBox) {
-				result.push(...body);
-			} else if (canBox && (body.length > 0 || language.trim())) {
-				result.push(...boxRenderedCodeBlock(body, language, width));
-			} else {
-				result.push(...body);
-			}
-			continue;
-		}
-		if (fence?.kind === "close") {
-			i++;
-			continue;
-		}
-		result.push(stripRenderedHeadingMarkers(lines[i]).replace(/###/g, ""));
-		i++;
+	for (const line of lines) {
+		if (parseRenderedFenceLine(line)) continue;
+		result.push(stripRenderedHeadingMarkers(line).replace(/###/g, ""));
 	}
 	return result;
 }
@@ -1732,14 +1637,13 @@ class DottedParagraph {
 		const lines = this.segments.flatMap((segment) => {
 			return segment.kind === "math"
 				? renderMathBlock(segment.raw, contentWidth, this.markdownTheme)
-				: sanitizeRenderedTextBlockLines(segment.md.render(contentWidth), contentWidth);
+				: sanitizeRenderedTextBlockLines(segment.md.render(contentWidth));
 		});
 		const looksLikeTaskStatus = lines.some((line) => /\b(?:transcript:|No output\.|Wrapped up)/.test(stripAnsi(line)));
 		const displayLines = looksLikeTaskStatus ? lines.map(normalizeLeadingCheckGlyph) : lines;
 		let dotPlaced = false;
 		const rendered = displayLines.map((line: string) => {
 			if (!stripAnsi(line).trim()) return `   ${line}`;
-			if (isCodeBoxChromeLine(line)) return `   ${line}`;
 			if (!dotPlaced) {
 				dotPlaced = true;
 				return ` ● ${line}`;
@@ -1842,7 +1746,7 @@ class ThinkingParagraph {
 			this.cachedLines = [clampLineWidth(` ${prefix} `, safeWidth)];
 			return this.cachedLines;
 		}
-		const lines = sanitizeRenderedTextBlockLines(md.render(safeWidth - PREFIX_W), safeWidth - PREFIX_W);
+		const lines = sanitizeRenderedTextBlockLines(md.render(safeWidth - PREFIX_W));
 		let symbolPlaced = false;
 		const rendered = lines.map((line: string) => {
 			if (!symbolPlaced && stripAnsi(line).trim()) {
@@ -3332,7 +3236,7 @@ function attenuateChromeAnsi(ansi: string, theme: any): string {
 	return `\x1b[38;2;${mix(rgb.r)};${mix(rgb.g)};${mix(rgb.b)}m`;
 }
 
-/** Shared outline chrome: user box, tool rules, code fences, branch connectors. */
+/** Shared outline chrome: user box, tool rules, and branch connectors. */
 function resolveThemeChromeFg(theme: any): string | null {
 	if (!theme || !themeAdaptiveEnabled()) return null;
 	const dim = safeFgAnsi(theme, "dim");
@@ -3356,13 +3260,12 @@ function currentToolBranchAnsi(theme?: any): string {
 	return toolBranchRgbAnsi(getConfiguredToolBranchGray());
 }
 
-/** User box, code fences, thinking/thought: branch + OUTLINE_CHROME_BRIGHTEN (never same as branch). */
+/** User box and thinking/thought: branch + OUTLINE_CHROME_BRIGHTEN (never same as branch). */
 function syncOutlineChromeFromBranch(theme?: any): void {
 	const outline = outlineChromeAnsiFromBranch(theme);
 	const prevBorder = BORDER_COLOR;
 	BORDER_COLOR = outline;
 	WORKED_LINE_FG = outline;
-	CODE_BLOCK_LANG_FG = outline;
 	if (outline !== prevBorder) bumpToolBranchVisualEpoch();
 }
 
@@ -3586,7 +3489,6 @@ const _explicitFgFields = new Set<"fgAdd" | "fgDel" | "fgDim" | "fgLnum" | "fgRu
 const _claudeStyleDefaults = {
 	BORDER_COLOR: "\x1b[38;5;238m",
 	WORKED_LINE_FG: "\x1b[38;2;140;140;140m",
-	CODE_BLOCK_LANG_FG: "\x1b[38;2;95;95;95m",
 	TOOL_RULE: toolBranchRgbAnsi(DEFAULT_TOOL_BRANCH_GRAY),
 	FG_DIM: "\x1b[38;2;80;80;80m",
 	FG_LNUM: "\x1b[38;2;100;100;100m",
@@ -3603,7 +3505,6 @@ const _claudeStyleDefaults = {
 function resetThemePalette(): void {
 	BORDER_COLOR = _claudeStyleDefaults.BORDER_COLOR;
 	WORKED_LINE_FG = _claudeStyleDefaults.WORKED_LINE_FG;
-	CODE_BLOCK_LANG_FG = _claudeStyleDefaults.CODE_BLOCK_LANG_FG;
 	applyToolBranchColor();
 	TOOL_STATUS_SUCCESS = _claudeStyleDefaults.TOOL_STATUS_SUCCESS;
 	TOOL_STATUS_ERROR = _claudeStyleDefaults.TOOL_STATUS_ERROR;
@@ -3648,7 +3549,7 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	const muted = safeFgAnsi(theme, "muted");
 	const dim = safeFgAnsi(theme, "dim") ?? muted;
 
-	// User box, code fences, thinking/thought text, and ├ └ │ all follow branch chrome.
+	// User box, thinking/thought text, and ├ └ │ all follow branch chrome.
 	applyToolBranchColor(theme);
 
 	const chromeFg = BORDER_COLOR;
