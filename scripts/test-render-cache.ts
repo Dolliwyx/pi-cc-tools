@@ -93,14 +93,31 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 3. User message: immutable content → deterministic across renders.
+// 3. User message: full-width theme highlight, no box chrome or label, cached.
 // ---------------------------------------------------------------------------
 {
-	const c = new UserMessageComponent("User asks a question with **bold** and `code`.");
-	const a = c.render(W);
-	const b = c.render(W);
+	const width = 28;
+	const c = new UserMessageComponent("First **Markdown** line wraps for alignment.\n\nSecond line.");
+	const a = c.render(width);
+	const b = c.render(width);
 	eq(b, a, "user: warm cache hit must equal cold render");
-	console.log("OK  user message: cache identical across renders");
+	const stripControl = (line: string) => line
+		.replace(/\x1b\[[0-9;]*m/g, "")
+		.replace(/\x1b\]133;[ABC]\x07/g, "");
+	const plain = a.map(stripControl);
+	if (plain.some((line) => /[╭╮╰╯│]/.test(line)) || plain.some((line) => /\bUser\b/.test(line))) {
+		throw new Error("user: box chrome or User label remains");
+	}
+	if (!plain.some((line) => line.includes("First Markdown")) || !plain.some((line) => line.includes("Second line."))) {
+		throw new Error("user: rendered Markdown text was lost");
+	}
+	if (!plain[0].startsWith(" ❯ ") || plain.slice(1).some((line) => line.trim() && !line.startsWith("   "))) {
+		throw new Error("user: prompt marker or continuation alignment is incorrect");
+	}
+	if (a.some((line) => !line.includes("\x1b[48;")) || plain.some((line) => line.length !== width)) {
+		throw new Error("user: lines are not full-width background highlights");
+	}
+	console.log("OK  user message: highlighted full-width lines + cache");
 }
 
 // ---------------------------------------------------------------------------

@@ -207,7 +207,6 @@ function applyToolBackgroundMode(theme: unknown): void {
 	const globalTheme = getGlobalPiTheme();
 	if (globalTheme) targets.add(globalTheme);
 	for (const t of targets) {
-		setThemeBg(t, "userMessageBg", TRANSPARENT_BG);
 		if (toolBackgroundMode === "default") continue;
 		setThemeBg(t, "toolPendingBg", TRANSPARENT_BG);
 		setThemeBg(t, "toolSuccessBg", TRANSPARENT_BG);
@@ -1908,19 +1907,6 @@ function stripBackgroundAnsi(text: string): string {
 	});
 }
 
-function roundedUserBorder(width: number, top: boolean): string {
-	if (width <= 1) return `${BORDER_COLOR}│${TRANSPARENT_RESET}`;
-	const left = top ? "╭" : "╰";
-	const right = top ? "╮" : "╯";
-	if (!top || width < 10) {
-		return `${BORDER_COLOR}${left}${"─".repeat(Math.max(0, width - 2))}${right}${TRANSPARENT_RESET}`;
-	}
-	const label = `${WORKED_LINE_FG} User ${TRANSPARENT_RESET}`;
-	const prefix = "─";
-	const suffixWidth = Math.max(0, width - 2 - visibleWidth(prefix) - visibleWidth(label));
-	return `${BORDER_COLOR}${left}${prefix}${TRANSPARENT_RESET}${label}${BORDER_COLOR}${"─".repeat(suffixWidth)}${right}${TRANSPARENT_RESET}`;
-}
-
 function trimAnsiRight(text: string): string {
 	let trimmed = text;
 	while (true) {
@@ -1930,15 +1916,27 @@ function trimAnsiRight(text: string): string {
 	}
 }
 
-function cleanUserMessageLine(line: string): string {
-	return `${TRANSPARENT_BG}${trimAnsiRight(stripBackgroundAnsi(stripOsc133Zones(line)))}${TRANSPARENT_BG}`;
+function highlightedUserMessageLine(line: string, width: number, promptStart = false): string {
+	const safeWidth = Math.min(width, terminalColumnCeiling() || width);
+	const clean = trimAnsiRight(stripBackgroundAnsi(stripOsc133Zones(line)));
+	const content = clampLineWidth(promptStart ? ` ❯ ${trimAnsiLeft(clean)}` : `   ${trimAnsiLeft(clean)}`, safeWidth);
+	const padding = " ".repeat(Math.max(0, safeWidth - visibleWidth(content)));
+	const background = safeBgAnsi(getGlobalPiTheme(), "userMessageBg")
+		?? safeBgAnsi(getGlobalPiTheme(), "selectedBg")
+		?? TRANSPARENT_BG;
+	return `${background}${content}${padding}${TRANSPARENT_RESET}`;
 }
 
-function borderedUserMessageLine(line: string, width: number): string {
-	const innerWidth = Math.max(1, width - 4);
-	const content = clampLineWidth(cleanUserMessageLine(line), innerWidth);
-	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-	return `${BORDER_COLOR}│${TRANSPARENT_RESET} ${content}${padding} ${BORDER_COLOR}│${TRANSPARENT_RESET}`;
+function isUserMessageBlankLine(line: string): boolean {
+	return stripAnsi(stripOsc133Zones(line)).trim().length === 0;
+}
+
+function trimUserMessageOuterBlankLines(lines: string[]): string[] {
+	let start = 0;
+	let end = lines.length;
+	while (start < end && isUserMessageBlankLine(lines[start])) start++;
+	while (end > start && isUserMessageBlankLine(lines[end - 1])) end--;
+	return lines.slice(start, end);
 }
 
 function visitMarkdownDescendants(root: unknown, visit: (md: InstanceType<typeof Markdown>) => void): void {
@@ -1966,17 +1964,12 @@ function patchUserMessageRender(): void {
 				child.invalidate?.();
 			}
 		});
-		const borderWidth = Math.max(1, width);
-		const contentWidth = Math.max(1, borderWidth - 4);
-		const lines = originalRender.call(this, contentWidth);
+		const renderWidth = Math.min(Math.max(1, width), terminalColumnCeiling() || Math.max(1, width));
+		const lines = originalRender.call(this, renderWidth);
 		if (!Array.isArray(lines) || lines.length === 0) return lines;
-		const rendered = [
-			roundedUserBorder(borderWidth, true),
-			...lines.map((line: string) => borderedUserMessageLine(line, borderWidth)),
-			roundedUserBorder(borderWidth, false),
-		];
-		const clamped = rendered.map((line) => clampLineWidth(line, borderWidth));
-		return storeMessageRenderCache(this, width, applyTerminalCopyZones(clamped));
+		const highlighted = trimUserMessageOuterBlankLines(lines)
+			.map((line: string, index: number) => highlightedUserMessageLine(line, renderWidth, index === 0));
+		return storeMessageRenderCache(this, width, applyTerminalCopyZones(highlighted));
 	};
 	proto[USER_MESSAGE_PATCH_FLAG] = true;
 }
