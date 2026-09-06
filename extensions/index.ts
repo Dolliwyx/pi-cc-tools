@@ -34,6 +34,7 @@ import {
 	getImageDimensions,
 	imageFallback,
 	Markdown,
+	ProcessTerminal,
 	Spacer,
 	Text,
 	truncateToWidth,
@@ -43,6 +44,14 @@ import {
 
 import * as Diff from "diff";
 import type { BundledLanguage, BundledTheme } from "shiki";
+
+import {
+	buildBashCommandPresentation,
+	buildBashPreview,
+	describeBashSource,
+	formatBashDuration,
+	getLastBashOutputLine,
+} from "./bash-command";
 
 const RESET = "\x1b[0m";
 const TRANSPARENT_BG = "\x1b[49m";
@@ -65,6 +74,8 @@ const CUSTOM_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-cust
 const USER_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-user-message-render");
 const UI_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-ui-notifications-v2");
 const WRAP_MARK = "\uE000";
+const CLIP_MARK = "\uE001";
+const TRAILING_MARK = "  · ";
 const KITTY_IMAGE_PREFIX = "\x1b_G";
 const ITERM2_IMAGE_PREFIX = "\x1b]1337;File=";
 
@@ -82,6 +93,8 @@ interface SettingsFile {
 	groupToolCalls?: boolean;
 	bashOutputMode?: "opencode" | "summary" | "preview";
 	bashCollapsedLines?: number;
+	/** Verbatim script lines shown while bash is running or after failure. Defaults to 8. */
+	bashCommandPreviewLines?: number;
 	/** Show a small live output preview while tools are still running. Defaults to true. */
 	liveToolPreview?: boolean;
 	/** Number of live output lines to show while collapsed. Defaults to 5. */
@@ -110,6 +123,13 @@ interface SettingsFile {
 	 * "(thinking · ↓ 10 tokens · 2s)" trailer). Defaults to "muted".
 	 */
 	spinnerStatusColor?: string;
+	/**
+	 * Thinking display mode. `live` (default): only the currently-streaming
+	 * thinking is expanded; finished thinking collapses to a one-line
+	 * `Thought for Xs` row (Ctrl+O still expands it). `full`: thinking always
+	 * renders expanded, like stock pi.
+	 */
+	thinkingMode?: "live" | "full";
 	/** Gray level 0–255 for ├ └ │ when branch color mode is `fixed`. */
 	toolBranchRgbGray?: number;
 	/** `fixed` (default): rgb gray 72, theme-independent. `theme`: dim → muted → borderMuted. */
@@ -382,6 +402,49 @@ function setToolGroupingEnabled(enabled: boolean): void {
 	writeSettingsKey("groupToolCalls", enabled);
 }
 
+type ThinkingMode = "live" | "full";
+
+function getThinkingMode(): ThinkingMode {
+	return getMode(readSettings().thinkingMode, ["live", "full"] as const, "live");
+}
+
+function isAssistantThinkingComplete(comp: any, message: any): boolean {
+	if (!message || message.role !== "assistant") return false;
+	if (typeof message[THINKING_DURATION_KEY] === "number") return true;
+	if (message[THINKING_ACTIVE_KEY]) return false;
+	// Providers keep stopReason "pending" for the whole stream ("deferred" while
+	// a deferred call is unresolved); both are in-flight sentinels, never
+	// completion signals. Without this, live-thinking detection would depend on
+	// THINKING_ACTIVE_KEY being stamped before the UI renders the same event.
+	if (message.stopReason === "pending" || message.stopReason === "deferred") return false;
+	if (typeof message.stopReason === "string" && message.stopReason.length > 0) return true;
+	if (Array.isArray(message.content)) {
+		let sawThinking = false;
+		for (const block of message.content) {
+			if (block?.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim()) {
+				sawThinking = true;
+			} else if (sawThinking && (
+				(block?.type === "text" && typeof block.text === "string" && block.text.trim()) ||
+				block?.type === "toolCall"
+			)) {
+				return true;
+			}
+		}
+		if (sawThinking) return false;
+	}
+	return true;
+}
+
+function isLiveThinkingMessage(comp: any, message: any): boolean {
+	if (!message || message.role !== "assistant") return false;
+	if (isAssistantThinkingComplete(comp, message)) return false;
+	if ((message as any)[THINKING_ACTIVE_KEY]) return true;
+	if (Array.isArray(message.content)) {
+		return message.content.some((b: any) => b?.type === "thinking" && typeof b?.thinking === "string" && b.thinking.trim());
+	}
+	return false;
+}
+
 type ToolStatus = "pending" | "success" | "error";
 
 function getToolStatusForGroup(tool: any): ToolStatus {
@@ -501,9 +564,22 @@ function formatToolNameList(tools: any[]): string {
 		counts.set(name, (counts.get(name) ?? 0) + 1);
 	}
 	return [...counts.entries()]
-		.slice(0, 4)
-		.map(([name, count]) => `${name}${count > 1 ? `×${count}` : ""}`)
-		.join(", ") + (counts.size > 4 ? ", …" : "");
+		.map(([name, count]) => `${humanizeToolName(name)}${count > 1 ? `×${count}` : ""}`)
+		.join(", ");
+}
+
+function getRepeatedToolSubject(tools: any[], groupedName: string | undefined): string {
+	if (!groupedName || tools.length === 0) return "";
+	if (groupedName === "read") {
+		const paths = tools.map((tool) => String(tool?.args?.path ?? ""));
+		if (paths[0] && paths.every((path) => path === paths[0])) {
+			return shortPath(process.cwd(), paths[0]);
+		}
+	}
+	const summaries = tools.map(getToolArgSummary);
+	return summaries[0] && summaries.every((summary) => summary === summaries[0])
+		? summaries[0]
+		: "";
 }
 
 function escapeRegex(text: string): string {
@@ -564,7 +640,7 @@ function getToolArgSummary(tool: any): string {
 		if (parts.length > 0) value += ` (${parts.join(", ")})`;
 		return value;
 	}
-	if (name === "bash") return summarizeText(args.command ?? "", 72);
+	if (name === "bash") return buildBashCommandPresentation(args.command ?? "").headline;
 	if (name === "grep") return `"${summarizeText(args.pattern ?? "", 40)}"${args.path ? ` in ${args.path}` : ""}`;
 	if (name === "find") return `"${summarizeText(args.pattern ?? "", 40)}"${args.path ? ` in ${args.path}` : ""}`;
 	if (name === "ls") return shortPath(process.cwd(), args.path ?? ".");
@@ -575,16 +651,80 @@ function getToolCallLine(tool: any): string {
 	const value = (tool as any)?.callRendererComponent?.value;
 	if (typeof value === "string" && value.trim()) {
 		const line = value.split("\n").find((line) => stripAnsi(line).trim()) ?? value;
-		return line.replaceAll(WRAP_MARK, "");
+		return line.replaceAll(WRAP_MARK, "").replaceAll(CLIP_MARK, "");
 	}
 	const summary = getToolArgSummary(tool);
 	const label = humanizeToolName(getToolName(tool));
 	return `${label}${summary ? ` ${summary}` : ""}`;
 }
 
-function getCompactToolLine(tool: any, width: number, groupedLabel?: string): string {
-	const content = removeGroupedToolPrefix(getToolCallLine(tool), groupedLabel);
-	return clampLineWidth(content || getToolName(tool), width);
+function alignTrailingMarkedLine(line: string, width: number): string {
+	const markerIndex = line.indexOf(TRAILING_MARK);
+	if (markerIndex === -1) return clampLineWidth(line, width);
+	const safeWidth = Math.max(1, width);
+	const left = line.slice(0, markerIndex);
+	const right = line.slice(markerIndex + TRAILING_MARK.length);
+	const rightWidth = visibleWidth(right);
+	if (rightWidth >= safeWidth) return truncateToWidth(right, safeWidth, "", false);
+	const leftBudget = Math.max(0, safeWidth - rightWidth - 2);
+	const clippedLeft = leftBudget > 0 ? truncateToWidth(left, leftBudget, "…", false) : "";
+	const gap = Math.max(1, safeWidth - visibleWidth(clippedLeft) - rightWidth);
+	return `${clippedLeft}${" ".repeat(gap)}${right}`;
+}
+
+function getCompactToolLine(tool: any, width: number, groupedLabel?: string, showTrailing = true): string {
+	let content = removeGroupedToolPrefix(getToolCallLine(tool), groupedLabel);
+	if (!showTrailing) content = content.split(TRAILING_MARK, 1)[0] ?? content;
+	return alignTrailingMarkedLine(content || getToolName(tool), width);
+}
+
+interface CollapsedToolEntry {
+	tools: any[];
+	name: string;
+	subject: string;
+}
+
+function collapseRepeatedToolEntries(tools: any[]): CollapsedToolEntry[] {
+	const entries: CollapsedToolEntry[] = [];
+	for (const tool of tools) {
+		const name = getToolName(tool);
+		const subject = getRepeatedToolSubject([tool], name);
+		const previous = entries[entries.length - 1];
+		if (subject && previous?.name === name && previous.subject === subject) {
+			previous.tools.push(tool);
+		} else {
+			entries.push({ tools: [tool], name, subject });
+		}
+	}
+	return entries;
+}
+
+function stripReadRangeFromToolLine(line: string): string {
+	return line.replace(
+		/\s+(?:\x1b\[[0-9;]*m)*\((?:offset|limit)=\d+(?:,\s*(?:offset|limit)=\d+)*\)(?=(?:\x1b\[[0-9;]*m)*$)/,
+		"",
+	);
+}
+
+function getCollapsedToolEntryLine(entry: CollapsedToolEntry, width: number, groupedLabel?: string): string {
+	if (entry.tools.length === 1) return getCompactToolLine(entry.tools[0], width, groupedLabel);
+	const counts = countToolStatuses(entry.tools);
+	const attentionCounts = counts.pending > 0 || counts.error > 0
+		? ` • ${formatToolGroupCounts(entry.tools)}`
+		: "";
+	const suffix = ` ${FG_DIM}×${entry.tools.length}${TRANSPARENT_RESET}${attentionCounts}`;
+	const firstLine = getCompactToolLine(entry.tools[0], Math.max(1, width - visibleWidth(suffix)), groupedLabel, false);
+	const sharedLine = entry.name === "read" ? stripReadRangeFromToolLine(firstLine) : firstLine;
+	return clampLineWidth(`${sharedLine}${suffix}`, width);
+}
+
+function getCollapsedToolEntryLines(entry: CollapsedToolEntry, width: number, groupedLabel?: string): string[] {
+	const lines = [getCollapsedToolEntryLine(entry, width, groupedLabel)];
+	if (entry.name !== "bash") return lines;
+	const running = [...entry.tools].reverse().find((tool) => getToolStatusForGroup(tool) === "pending");
+	const latestOutput = running ? getLastBashOutputLine(getTextContent(running.result)) : undefined;
+	if (latestOutput) lines.push(`${FG_DIM}${latestOutput}${TRANSPARENT_RESET}`);
+	return lines;
 }
 
 function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: string): string[] {
@@ -763,26 +903,48 @@ class ToolGroupComponent extends Container {
 		if (status.success) countParts.push(statusText("success", status.success));
 		if (status.error) countParts.push(statusText("error", status.error));
 		const countsText = countParts.join(`${TRANSPARENT_RESET} • `);
-		const summary = ` ${light} ${summaryLabel} ${countsText}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${toolOutputDetailHint(undefined as any, this.expanded, true)}`;
-		const lines = [" ".repeat(safeWidth), clampLineWidth(summary, safeWidth)];
-		const childWidth = Math.max(1, safeWidth - 6);
 		const total = this.tools.length;
-
-		for (let index = 0; index < total; index++) {
-			const tool = this.tools[index];
-			const rawLines = this.expanded
-				? getExpandedToolGroupLines(tool, childWidth, groupedName ? label : undefined)
-				: [getCompactToolLine(tool, childWidth, groupedName ? label : undefined)];
-			const branched = formatBranchedToolLines(
-				rawLines,
-				index,
-				total,
+		const lines: string[] = [];
+		const subject = this.expanded ? "" : getRepeatedToolSubject(this.tools, groupedName);
+		const collapseToSingleRow = !this.expanded && !!groupedName && !!subject;
+		if (collapseToSingleRow) {
+			const entry = { tools: this.tools, name: groupedName, subject };
+			const entryLine = getCollapsedToolEntryLine(entry, Math.max(1, safeWidth - 3));
+			lines.push(clampLineWidth(
+				` ${light} ${entryLine}${toolOutputDetailHint(undefined as any, false, true)}`,
 				safeWidth,
-				getToolStatusForGroup(tool),
-				{ agentBreathe: isAgentFamilyToolName(getToolName(tool)) },
-			);
-			for (let i = 0; i < branched.length; i++) {
-				lines.push(clampLineWidth(branched[i], safeWidth));
+			));
+		} else {
+			const summary = ` ${light} ${summaryLabel} ${countsText}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${toolOutputDetailHint(undefined as any, this.expanded, true)}`;
+			lines.push(" ".repeat(safeWidth), clampLineWidth(summary, safeWidth));
+			const childWidth = Math.max(1, safeWidth - 6);
+			if (this.expanded) {
+				for (let index = 0; index < total; index++) {
+					const tool = this.tools[index];
+					const branched = formatBranchedToolLines(
+						getExpandedToolGroupLines(tool, childWidth, groupedName ? label : undefined),
+						index,
+						total,
+						safeWidth,
+						getToolStatusForGroup(tool),
+						{ agentBreathe: isAgentFamilyToolName(getToolName(tool)) },
+					);
+					for (const line of branched) lines.push(clampLineWidth(line, safeWidth));
+				}
+			} else {
+				const entries = collapseRepeatedToolEntries(this.tools);
+				for (let index = 0; index < entries.length; index++) {
+					const entry = entries[index];
+					const branched = formatBranchedToolLines(
+						getCollapsedToolEntryLines(entry, childWidth, groupedName ? label : undefined),
+						index,
+						entries.length,
+						safeWidth,
+						getToolGroupOverallStatus(entry.tools),
+						{ agentBreathe: entry.tools.every((tool) => isAgentFamilyToolName(getToolName(tool))) },
+					);
+					for (const line of branched) lines.push(clampLineWidth(line, safeWidth));
+				}
 			}
 		}
 
@@ -808,23 +970,36 @@ function isToolGroupComponent(value: unknown): value is ToolGroupComponent {
 	return value instanceof ToolGroupComponent;
 }
 
+function isSpacerComponent(value: unknown): value is InstanceType<typeof Spacer> {
+	return value instanceof Spacer || (value as any)?.constructor?.name === "Spacer";
+}
+
+function isTextComponent(value: unknown): value is InstanceType<typeof Text> {
+	return value instanceof Text || (value as any)?.constructor?.name === "Text";
+}
+
+function isMarkdownComponent(value: unknown): value is InstanceType<typeof Markdown> {
+	return value instanceof Markdown || (value as any)?.constructor?.name === "Markdown";
+}
+
 function isIgnorableToolSeparator(value: unknown): boolean {
-	if (value instanceof Spacer) return true;
-	if (value instanceof AssistantMessageComponent) {
+	if (isSpacerComponent(value)) return true;
+	if (value instanceof AssistantMessageComponent || (value as any)?.constructor?.name === "AssistantMessageComponent") {
+		// Empty assistant framing stays ignorable so it never splits tool groups.
+		// A rendered thinking row ("Thought for Xs" / live thinking) is a visible
+		// boundary: tool calls that follow it must start a new group instead of
+		// silently joining the batch that ran before the thought.
 		const contentChildren = (value as any).contentContainer?.children;
-		return Array.isArray(contentChildren) && contentChildren.length === 0;
+		if (!Array.isArray(contentChildren) || contentChildren.length === 0) return true;
+		return contentChildren.every((child: any) => isSpacerComponent(child));
 	}
 	return false;
 }
 
 function findPreviousToolSibling(children: any[], startIndex: number): { child: any; index: number } | undefined {
-	let skippedSeparators = 0;
 	for (let index = startIndex; index >= 0; index--) {
 		const child = children[index];
-		if (isIgnorableToolSeparator(child) && skippedSeparators < 3) {
-			skippedSeparators++;
-			continue;
-		}
+		if (isIgnorableToolSeparator(child)) continue;
 		return { child, index };
 	}
 	return undefined;
@@ -849,6 +1024,58 @@ function ungroupActiveToolGroups(): void {
 	}
 }
 
+function isThinkingOnlyAssistantComponent(comp: unknown): comp is InstanceType<typeof AssistantMessageComponent> {
+	if (!comp || ((comp as any).constructor?.name !== "AssistantMessageComponent" && !(comp instanceof AssistantMessageComponent))) {
+		return false;
+	}
+	const msg = (comp as any).lastMessage;
+	if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return false;
+	const hasThinking = msg.content.some((c: any) => c?.type === "thinking" && typeof c?.thinking === "string" && c.thinking.trim());
+	if (!hasThinking) return false;
+	const hasText = msg.content.some((c: any) => c?.type === "text" && typeof c?.text === "string" && c.text.trim());
+	if (hasText) return false;
+	const hasToolCalls = msg.content.some((c: any) => c?.type === "toolCall");
+	if (hasToolCalls) return false;
+	if ((comp as any).isStreaming === true || msg[THINKING_ACTIVE_KEY]) return false;
+	return true;
+}
+
+function maybeMergeConsecutiveThinkingMessages(parent: any): void {
+	const children = parent?.children;
+	if (!Array.isArray(children) || children.length < 2) return;
+
+	for (let i = 0; i < children.length; i++) {
+		const current = children[i];
+		if (!isThinkingOnlyAssistantComponent(current)) continue;
+
+		let nextIdx = i + 1;
+		while (nextIdx < children.length && isSpacerComponent(children[nextIdx])) {
+			nextIdx++;
+		}
+		if (nextIdx >= children.length) break;
+
+		const nextComp = children[nextIdx];
+		if (isThinkingOnlyAssistantComponent(nextComp)) {
+			const curMsg = (current as any).lastMessage;
+			const nextMsg = (nextComp as any).lastMessage;
+
+			const durA = getMessageThinkingDurationMs(curMsg);
+			const durB = getMessageThinkingDurationMs(nextMsg);
+			const mergedDuration = durA + durB;
+
+			const nextThinkingBlocks = nextMsg.content.filter((c: any) => c?.type === "thinking");
+			curMsg.content.push(...nextThinkingBlocks);
+			curMsg[THINKING_DURATION_KEY] = mergedDuration;
+
+			(current as any).updateContent(curMsg);
+
+			const removeCount = nextIdx - i;
+			children.splice(i + 1, removeCount);
+			i--;
+		}
+	}
+}
+
 function maybeGroupToolComponent(parent: any, component: any): void {
 	if (!toolGroupingEnabled() || !isGroupableTool(component) || isToolGroupComponent(parent)) return;
 	const children = parent?.children;
@@ -861,6 +1088,7 @@ function maybeGroupToolComponent(parent: any, component: any): void {
 	if (isToolGroupComponent(previous)) {
 		children.splice(index, 1);
 		previous.addTool(component);
+		maybeMergeConsecutiveThinkingMessages(parent);
 		return;
 	}
 	if (isGroupableTool(previous)) {
@@ -871,6 +1099,7 @@ function maybeGroupToolComponent(parent: any, component: any): void {
 		(group as any)[COMPONENT_PARENT] = parent;
 		children[previousEntry.index] = group;
 		children.splice(index, 1);
+		maybeMergeConsecutiveThinkingMessages(parent);
 	}
 }
 
@@ -884,6 +1113,7 @@ function patchContainerParentTracking(): void {
 		const result = originalAddChild.call(this, component);
 		if (component && typeof component === "object") component[COMPONENT_PARENT] = this;
 		maybeGroupToolComponent(this, component);
+		maybeMergeConsecutiveThinkingMessages(this);
 		return result;
 	};
 	proto.removeChild = function patchedRemoveChild(component: any) {
@@ -929,6 +1159,7 @@ function patchGlobalToolBorders(): void {
 
 	const originalRender = proto.render;
 	proto.render = function patchedContainerRender(width: number): string[] {
+		maybeMergeConsecutiveThinkingMessages(this);
 		if (isToolExecutionLike(this)) {
 			const cached = (this as any)[TOOL_RENDER_CACHE];
 			const branchKey = toolBranchRenderCacheKey();
@@ -1117,12 +1348,12 @@ const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 const WORKED_DURATION_KEY = "_piClaudeStyleWorkedDurationMs";
-const THINKING_DURATION_KEY = "_piClaudeStyleThinkingDurationMs";
-const THINKING_ACTIVE_KEY = "_piClaudeStyleThinkingActive";
 const WORKED_START_KEY = "_piClaudeStyleWorkedStartMs";
 const WORKED_SESSION_TOTAL_KEY = "_piClaudeStyleWorkedSessionTotalMs";
 const WORKED_TURNS_KEY = "_piClaudeStyleWorkedTurns";
 const WORKED_DURATION_MARKER = "Turn took";
+const THINKING_DURATION_KEY = "_piClaudeStyleThinkingDurationMs";
+const THINKING_ACTIVE_KEY = "_piClaudeStyleThinkingActive";
 const MIN_THINKING_SUMMARY_MS = 100;
 
 let lastThinkingBlockDurationMs: number | undefined;
@@ -1239,32 +1470,43 @@ class HiddenThinkingSummary {
 	}
 }
 
-function assistantMessageThinkingComplete(message: any): boolean {
-	// toolUse is an intermediate assistant chunk — thinking may still be in progress on the next chunk.
-	const reason = message?.stopReason;
-	if (reason === "toolUse") return false;
-	return typeof reason === "string" && reason.length > 0;
+function getMessageThinkingDurationMs(message: any): number {
+	const stored = (message as any)?.[THINKING_DURATION_KEY];
+	if (typeof stored === "number" && stored > 0) return stored;
+	if (typeof lastThinkingBlockDurationMs === "number" && lastThinkingBlockDurationMs > 0) {
+		return lastThinkingBlockDurationMs;
+	}
+	if (typeof (message as any)?.[WORKED_DURATION_KEY] === "number" && (message as any)[WORKED_DURATION_KEY] > 0) {
+		return (message as any)[WORKED_DURATION_KEY];
+	}
+	let totalChars = 0;
+	if (Array.isArray(message?.content)) {
+		for (const block of message.content) {
+			if (block?.type === "thinking" && typeof block.thinking === "string") {
+				totalChars += block.thinking.length;
+			}
+		}
+	}
+	return Math.max(1000, Math.round((totalChars / 150) * 1000));
 }
 
-function hiddenThinkingSummaryForMessage(message: any): string {
-	// Per-message flags win over globals so a late render pass cannot keep
-	// "Thinking…" after thinking_end already stored duration on this message.
-	if ((message as any)?.[THINKING_ACTIVE_KEY]) return thinkingActiveSummaryText();
-	const stored = (message as any)?.[THINKING_DURATION_KEY];
-	const durationMs = typeof stored === "number"
-		? stored
-		: assistantMessageThinkingComplete(message) && typeof lastThinkingBlockDurationMs === "number"
-			? lastThinkingBlockDurationMs
-			: undefined;
-	if (typeof durationMs === "number" && durationMs >= MIN_THINKING_SUMMARY_MS) {
-		return thoughtDurationSummaryText(durationMs);
+function assistantMessageThinkingComplete(this: any, message: any): boolean {
+	return isAssistantThinkingComplete(this, message);
+}
+
+function hiddenThinkingSummaryForMessage(message: any, comp?: any): string {
+	if (message && !isAssistantThinkingComplete(comp, message) && isLiveThinkingMessage(comp, message)) {
+		return thinkingActiveSummaryText();
 	}
-	if (thinkingBlockInFlight) return thinkingActiveSummaryText();
-	return thinkingActiveSummaryText();
+	const durationMs = getMessageThinkingDurationMs(message);
+	if (message && typeof message === "object") {
+		(message as any)[THINKING_DURATION_KEY] = durationMs;
+	}
+	return thoughtDurationSummaryText(durationMs);
 }
 
 function isHiddenThinkingPlaceholderText(child: unknown): child is InstanceType<typeof Text> {
-	if (!(child instanceof Text)) return false;
+	if (!isTextComponent(child)) return false;
 	const plain = stripAnsi(String((child as any).text ?? "")).trim();
 	if (/^[✻∴]\s*Thinking/i.test(plain)) return true;
 	if (/^[✻∴]\s*Thought for/i.test(plain)) return true;
@@ -1287,10 +1529,6 @@ function workedDurationText(ms: number, sessionTotalMs?: number, turns?: number)
 	return `${text}${RESET}`;
 }
 
-function inlineWorkedDurationText(ms: number, sessionTotalMs?: number, turns?: number): string {
-	return workedDurationText(ms, sessionTotalMs, turns);
-}
-
 function isWorkedDurationLine(line: string): boolean {
 	return line.includes(WORKED_DURATION_MARKER) && /^✻ Turn took [^\r\n]+$/.test(stripAnsi(line).trim());
 }
@@ -1310,15 +1548,6 @@ function hasWorkedDurationLine(message: any): boolean {
 		if (block?.type !== "text" || typeof block.text !== "string" || !block.text.includes(WORKED_DURATION_MARKER)) return false;
 		return block.text.split(/\r?\n/).some(isWorkedDurationLine);
 	});
-}
-
-function appendWorkedDurationLine(message: any, durationMs: number, sessionTotalMs?: number, turns?: number): void {
-	if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
-	const textBlocks = message.content.filter((block: any) => block?.type === "text" && typeof block.text === "string" && block.text.trim());
-	const lastText = textBlocks[textBlocks.length - 1];
-	if (!lastText) return;
-	const text = lastText.text.includes(WORKED_DURATION_MARKER) ? stripWorkedDurationLine(lastText.text) : lastText.text;
-	lastText.text = `${text.trimEnd()}\n\n${inlineWorkedDurationText(durationMs, sessionTotalMs, turns)}`;
 }
 
 type MarkdownThemeLike = ConstructorParameters<typeof Markdown>[3];
@@ -1395,6 +1624,50 @@ const MAGIC_CONTEXT_TAG_LINE_PREFIX = /(^|\r?\n)[ \t]*(?:§\d+§[ \t]*)+/g;
 
 function stripTransientMagicContextTags(text: string): string {
 	return text.replace(MAGIC_CONTEXT_TAG_LINE_PREFIX, "$1");
+}
+
+// Tool results can carry transient Magic Context tags too (live-prefixed output
+// chunks). Renderers must see sanitized text WITHOUT mutating this.result — the
+// result object is the stored message used by context management. Clone blocks
+// only when a tag is actually present so the common path stays zero-cost.
+function sanitizeToolResultForDisplay(result: any): any {
+	if (!result || !Array.isArray(result.content)) return result;
+	let changed = false;
+	const content = result.content.map((block: any) => {
+		if (block && typeof block.text === "string") {
+			const stripped = stripTransientMagicContextTags(block.text);
+			if (stripped !== block.text) {
+				changed = true;
+				return { ...block, text: stripped };
+			}
+		}
+		return block;
+	});
+	return changed ? { ...result, content } : result;
+}
+
+// Last-resort display scrubber at the terminal writer choke point. Every
+// rendered frame — every component, overlay, preview, and search hit — exits
+// through ProcessTerminal.write, so stripping complete §N§ tokens there covers
+// any surface the targeted strips above can't reach, including mid-sentence
+// tag references replayed from old tool output on resume. Display only:
+// storage, LLM context, copy/paste sources, and ANSI sequences are untouched
+// (tags are plain characters; escape sequences never contain them).
+const MAGIC_CONTEXT_TAG_TOKEN = /§\d+§/g;
+const TERMINAL_SCRUB_PATCH_FLAG = Symbol.for("pi-claude-style-tools:terminal-write-tag-scrub");
+
+function patchTerminalWriteTagScrubber(): void {
+	const proto = (ProcessTerminal as any)?.prototype;
+	if (!proto || proto[TERMINAL_SCRUB_PATCH_FLAG]) return;
+	const originalWrite = proto.write;
+	if (typeof originalWrite !== "function") return;
+	proto.write = function patchedTerminalWrite(this: any, data: any, ...rest: any[]) {
+		if (typeof data === "string" && data.includes("§")) {
+			data = data.replace(MAGIC_CONTEXT_TAG_TOKEN, "");
+		}
+		return originalWrite.call(this, data, ...rest);
+	};
+	proto[TERMINAL_SCRUB_PATCH_FLAG] = true;
 }
 
 function replaceInlineMath(text: string): string {
@@ -1660,14 +1933,27 @@ class DottedParagraph {
 function replaceHiddenThinkingPlaceholders(container: { children?: any[] }, message: any): void {
 	if (!container?.children) return;
 	const summary = hiddenThinkingSummaryForMessage(message);
+	let firstReplaced = false;
 	for (let i = 0; i < container.children.length; i++) {
 		const child = container.children[i];
-		if (child instanceof HiddenThinkingSummary) {
-			child.setSummary(summary);
+		if (child instanceof HiddenThinkingSummary || (child as any)?.constructor?.name === "HiddenThinkingSummary") {
+			if (!firstReplaced) {
+				child.setSummary(summary);
+				firstReplaced = true;
+			} else {
+				container.children.splice(i, 1);
+				i--;
+			}
 			continue;
 		}
 		if (isHiddenThinkingPlaceholderText(child)) {
-			container.children[i] = new HiddenThinkingSummary(summary);
+			if (!firstReplaced) {
+				container.children[i] = new HiddenThinkingSummary(summary);
+				firstReplaced = true;
+			} else {
+				container.children.splice(i, 1);
+				i--;
+			}
 		}
 	}
 }
@@ -1683,7 +1969,7 @@ class ThinkingParagraph {
 		_markdownTheme: ConstructorParameters<typeof Markdown>[3],
 		_defaultTextStyle?: ConstructorParameters<typeof Markdown>[4],
 	) {
-		this.text = text;
+		this.text = stripTransientMagicContextTags(text);
 	}
 
 	private thinkingMarkdown(): InstanceType<typeof Markdown> {
@@ -1861,6 +2147,16 @@ function patchCustomMessageRender(): void {
 		syncToolBackgroundMode();
 		const cached = messageRenderCacheHit(this, width);
 		if (cached) return cached;
+		visitMarkdownDescendants(this, (child) => {
+			const markdownAny = child as any;
+			if (typeof markdownAny.text === "string") {
+				const stripped = stripTransientMagicContextTags(markdownAny.text);
+				if (stripped !== markdownAny.text) {
+					markdownAny.text = stripped;
+					child.invalidate?.();
+				}
+			}
+		});
 		const lines = originalRender.call(this, width);
 		if (!Array.isArray(lines)) return lines;
 		const result = isSubagentNotificationMessage(this?.message)
@@ -1942,7 +2238,7 @@ function visitMarkdownDescendants(root: unknown, visit: (md: InstanceType<typeof
 	if (!root || typeof root !== "object") return;
 	const node = root as { children?: unknown[] };
 	for (const child of node.children ?? []) {
-		if (child instanceof Markdown) visit(child);
+		if (isMarkdownComponent(child)) visit(child);
 		else visitMarkdownDescendants(child, visit);
 	}
 }
@@ -1957,6 +2253,13 @@ function patchUserMessageRender(): void {
 		if (cached) return cached;
 		visitMarkdownDescendants(this, (child) => {
 			const markdownAny = child as any;
+			if (typeof markdownAny.text === "string") {
+				const stripped = stripTransientMagicContextTags(markdownAny.text);
+				if (stripped !== markdownAny.text) {
+					markdownAny.text = stripped;
+					child.invalidate?.();
+				}
+			}
 			makeMarkdownLinksCopySafe(child);
 			if (markdownAny.defaultTextStyle?.bgColor) {
 				markdownAny.defaultTextStyle.bgColor = undefined;
@@ -1981,6 +2284,16 @@ function patchAssistantMessages(): void {
 		proto.render = function patchedAssistantMessageRender(width: number) {
 			const cached = messageRenderCacheHit(this, width);
 			if (cached) return cached;
+			visitMarkdownDescendants(this, (child) => {
+				const markdownAny = child as any;
+				if (typeof markdownAny.text === "string") {
+					const stripped = stripTransientMagicContextTags(markdownAny.text);
+					if (stripped !== markdownAny.text) {
+						markdownAny.text = stripped;
+						child.invalidate?.();
+					}
+				}
+			});
 			const lines = originalRender.call(this, width);
 			if (!Array.isArray(lines) || lines.length === 0) return lines;
 			if ((this as any).hasToolCalls) {
@@ -1993,7 +2306,7 @@ function patchAssistantMessages(): void {
 		proto[ASSISTANT_RENDER_PATCH_FLAG] = true;
 	}
 	const originalUpdateContent = proto.updateContent;
-	proto.updateContent = function patchedUpdateContent(message: any) {
+	proto.updateContent = function patchedUpdateContent(message: any, isStreaming?: boolean) {
 		// Content changed (also reached via invalidate() → updateContent): drop the
 		// cached rendered output so the next render rebuilds with the new children.
 		clearMessageRenderCache(this);
@@ -2001,24 +2314,39 @@ function patchAssistantMessages(): void {
 			(this as any)[WORKED_START_KEY] = Date.now();
 		}
 		if (!message || !Array.isArray(message.content)) {
-			return originalUpdateContent.call(this, message);
+			return originalUpdateContent.call(this, message, isStreaming);
 		}
-		if ((this as any).hideThinkingBlock && messageHasThinkingContent(message)) {
+		// Thinking display:
+		// When thinking blocks are expanded via Ctrl+T (`hideThinkingBlock === false`),
+		// all thinking blocks (old and new) render in full markdown.
+		// When thinking blocks are collapsed (`hideThinkingBlock === true`):
+		// - "live" mode (default): the actively-streaming thinking block renders
+		//   expanded while streaming, and collapses to `Thought for Xs` once done.
+		// - "full" mode: behaves like stock pi (stays collapsed).
+		const liveMode = getThinkingMode() === "live";
+		const thinkingCollapsed = !!(this as any).hideThinkingBlock;
+		const showLiveThinking = liveMode && thinkingCollapsed && isLiveThinkingMessage(this, message);
+		if (thinkingCollapsed && messageHasThinkingContent(message)) {
 			// Pi wraps this in theme.italic/fg again — keep plain label for the placeholder pass.
 			(this as any).hiddenThinkingLabel = "Thinking…";
 		}
-		// Call original to build all children (text, thinking, spacers, errors)
-		originalUpdateContent.call(this, message);
+		if (showLiveThinking) (this as any).hideThinkingBlock = false;
+		try {
+			// Call original to build all children (text, thinking, spacers, errors)
+			originalUpdateContent.call(this, message, isStreaming);
+		} finally {
+			if (showLiveThinking) (this as any).hideThinkingBlock = true;
+		}
 		// Replace text-block Markdown children with DottedParagraph wrappers
 		const container = (this as any).contentContainer;
 		if (!container?.children) return;
-		if ((this as any).hideThinkingBlock && messageHasThinkingContent(message)) {
+		if (thinkingCollapsed && !showLiveThinking && messageHasThinkingContent(message)) {
 			replaceHiddenThinkingPlaceholders(container, message);
 		}
 		const mdTheme = (this as any).markdownTheme;
 		for (let i = container.children.length - 1; i >= 0; i--) {
 			const child = container.children[i];
-			if (child instanceof Markdown) {
+			if (isMarkdownComponent(child)) {
 				const text = (child as any).text;
 				if (!text) continue;
 				const isThinking = !!(child as any).defaultTextStyle?.italic;
@@ -2034,16 +2362,11 @@ function patchAssistantMessages(): void {
 		const explicitSessionTotal = (message as any)[WORKED_SESSION_TOTAL_KEY];
 		const explicitTurns = (message as any)[WORKED_TURNS_KEY];
 		// The "Turn took" line must only appear once the stream has truly closed.
-		// `message.stopReason === "stop"` is NOT a safe "finished" signal here: the
-		// Anthropic provider initializes the live message's stopReason to "stop" at
-		// creation and only updates it to the real value when `message_delta` arrives
-		// near the end of the stream — so it is already "stop" while text is still
-		// streaming, which made the line appear mid-stream. `explicitDuration` is
-		// stamped onto the message by the `message_end` handler (which fires after
-		// `message_delta`, when stopReason is the real final value), so gating on it
-		// guarantees the line shows only after the run is actually done. The line is
-		// baked into the message text at message_end; this child is just a fallback
-		// for re-renders where that baked text isn't present.
+		// `message.stopReason === "stop"` is not a safe "finished" signal here because
+		// providers may initialize a live message with that value. The `message_end`
+		// handler stamps `explicitDuration` after the final stream event. Render the
+		// styled line as a TUI child so ANSI presentation never enters message content
+		// or persisted session transcripts.
 		const isFinalAssistantMessage = message.stopReason === "stop";
 		const workedDuration = typeof explicitDuration === "number" ? explicitDuration : undefined;
 		const workedSessionTotal = typeof explicitSessionTotal === "number"
@@ -2193,16 +2516,30 @@ function patchToolExecutionRenderers(): void {
 
 	proto.getResultRenderer = function patchedGetResultRenderer() {
 		const toolName = typeof this?.toolName === "string" ? this.toolName : "";
+		let renderer: any;
 		if (toolName === "apply_patch") {
-			return (result: any, options: any, theme: Theme, ctx: any) =>
+			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
 				renderApplyPatchResult({ content: result.content, details: result.details }, options.isPartial, theme, ctx);
-		}
-		if (shouldUseGenericToolRenderer(toolName)) {
-			return (result: any, options: any, theme: Theme, ctx: any) =>
+		} else if (shouldUseGenericToolRenderer(toolName)) {
+			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
 				renderGenericToolResult(toolName, result, options, theme, ctx);
+		} else {
+			renderer = typeof originalGetResultRenderer === "function" ? originalGetResultRenderer.call(this) : undefined;
 		}
-		return typeof originalGetResultRenderer === "function" ? originalGetResultRenderer.call(this) : undefined;
+		if (typeof renderer !== "function") return renderer;
+		// Strip transient Magic Context tags from the text the renderer sees,
+		// without touching the stored result message.
+		return (result: any, options: any, theme: Theme, ctx: any) => renderer(sanitizeToolResultForDisplay(result), options, theme, ctx);
 	};
+
+	// Fallback path for tools without a renderer definition formats raw text.
+	const originalFormatToolExecution = proto.formatToolExecution;
+	if (typeof originalFormatToolExecution === "function") {
+		proto.formatToolExecution = function patchedFormatToolExecution(this: any, ...args: any[]) {
+			const formatted = originalFormatToolExecution.apply(this, args);
+			return typeof formatted === "string" ? stripTransientMagicContextTags(formatted) : formatted;
+		};
+	}
 
 	proto[TOOL_EXECUTION_PATCH_FLAG] = true;
 }
@@ -2237,6 +2574,82 @@ function liveLineCountTrailing(ctx: any, theme: Theme): string {
 	const count = ctx?.state?._liveLineCount;
 	if (typeof count !== "number" || !Number.isFinite(count) || count <= 0) return "";
 	return ` ${theme.fg("muted", `(${lineCountLabel(count)})`)}`;
+}
+
+const BASH_STARTED_AT_KEY = "_bashStartedAtMs";
+const BASH_ENDED_AT_KEY = "_bashEndedAtMs";
+
+type BashDurationEntry = { invalidate: () => void };
+
+const BASH_DURATION_CONTEXTS = new Map<any, BashDurationEntry>();
+let bashDurationTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleBashDurationTick(): void {
+	if (bashDurationTimer || BASH_DURATION_CONTEXTS.size === 0) return;
+	bashDurationTimer = setTimeout(() => {
+		bashDurationTimer = null;
+		for (const entry of BASH_DURATION_CONTEXTS.values()) {
+			try { entry.invalidate(); } catch { /* noop */ }
+		}
+		scheduleBashDurationTick();
+	}, 1_000);
+	unrefTimer(bashDurationTimer);
+}
+
+function registerBashDurationContext(ctx: any): void {
+	const key = ctx?.state ?? ctx;
+	if (!key) return;
+	const invalidate = typeof ctx?.invalidate === "function" ? () => safeInvalidate(ctx) : () => {};
+	BASH_DURATION_CONTEXTS.set(key, { invalidate });
+	scheduleBashDurationTick();
+}
+
+function clearBashDurationContext(ctx: any): void {
+	const key = ctx?.state ?? ctx;
+	if (key) BASH_DURATION_CONTEXTS.delete(key);
+	if (bashDurationTimer && BASH_DURATION_CONTEXTS.size === 0) {
+		clearTimeout(bashDurationTimer);
+		bashDurationTimer = null;
+	}
+}
+
+function clearAllBashDurationContexts(): void {
+	BASH_DURATION_CONTEXTS.clear();
+	if (bashDurationTimer) {
+		clearTimeout(bashDurationTimer);
+		bashDurationTimer = null;
+	}
+}
+
+function syncBashDuration(ctx: any, isPartial = true): void {
+	const state = ctx?.state;
+	if (!state) return;
+	if (state._toolStatus === "pending" && typeof state[BASH_STARTED_AT_KEY] !== "number") {
+		state[BASH_STARTED_AT_KEY] = Date.now();
+		delete state[BASH_ENDED_AT_KEY];
+	}
+	const startedAt = state[BASH_STARTED_AT_KEY];
+	if (typeof startedAt !== "number") return;
+	if (!isPartial || ctx?.isError) {
+		if (typeof state[BASH_ENDED_AT_KEY] !== "number") state[BASH_ENDED_AT_KEY] = Date.now();
+		clearBashDurationContext(ctx);
+		return;
+	}
+	registerBashDurationContext(ctx);
+}
+
+function bashHeaderTrailing(ctx: any, theme: Theme): string {
+	const parts: string[] = [];
+	if (ctx?.isPartial === true) {
+		const count = ctx?.state?._liveLineCount;
+		if (typeof count === "number" && Number.isFinite(count) && count > 0) parts.push(lineCountLabel(count));
+	}
+	const startedAt = ctx?.state?.[BASH_STARTED_AT_KEY];
+	if (typeof startedAt === "number") {
+		const endedAt = ctx?.state?.[BASH_ENDED_AT_KEY];
+		parts.push(formatBashDuration((typeof endedAt === "number" ? endedAt : Date.now()) - startedAt));
+	}
+	return parts.length > 0 ? `${TRAILING_MARK}${theme.fg("muted", parts.join(" · "))}` : "";
 }
 
 function setToolStatus(ctx: any, status: "pending" | "success" | "error" | "idle"): void {
@@ -2515,6 +2928,10 @@ function withBranch(content: string, theme: Theme, _isError = false, continued =
 	return `${branchLead(first, continued, theme)}\n${rest.join("\n")}`;
 }
 
+function withClippedBranch(content: string, theme: Theme, continued = false): string {
+	return withBranch(content, theme, false, continued).replaceAll(WRAP_MARK, CLIP_MARK);
+}
+
 function withFinalBranchBlock(content: string, theme: Theme, isError = false): string {
 	if (!content || !content.trim()) return "";
 	const lines = content.split("\n");
@@ -2785,6 +3202,16 @@ function markedContinuationPrefix(prefix: string): string {
 }
 
 function wrapMarkedLine(line: string, width: number): string[] {
+	const clipIndex = line.indexOf(CLIP_MARK);
+	if (clipIndex !== -1) {
+		const prefix = line.slice(0, clipIndex);
+		const body = line.slice(clipIndex + CLIP_MARK.length);
+		if (body.includes(TRAILING_MARK)) return [alignTrailingMarkedLine(`${prefix}${body}`, width)];
+		const bodyWidth = Math.max(1, width - visibleWidth(prefix));
+		if (visibleWidth(body) <= bodyWidth) return [`${prefix}${body}`];
+		const hint = "…";
+		return [`${prefix}${truncateToWidth(body, Math.max(0, bodyWidth - visibleWidth(hint)), "", false)}${hint}`];
+	}
 	const markerIndex = line.indexOf(WRAP_MARK);
 	if (markerIndex === -1) return wrapTextWithAnsi(line, width);
 	const prefix = line.slice(0, markerIndex);
@@ -2801,6 +3228,10 @@ class ToolText extends Text {
 	private toolCachedValue?: string;
 	private toolCachedWidth?: number;
 	private toolCachedLines?: string[];
+	private observedWidth?: number;
+	private pendingObservedWidth?: number;
+	private widthObserver?: (width: number) => void;
+	private widthObserverScheduled = false;
 
 	constructor(text = "") {
 		super("", 0, 0);
@@ -2813,6 +3244,26 @@ class ToolText extends Text {
 		this.invalidate();
 	}
 
+	setWidthObserver(observer?: (width: number) => void): void {
+		this.widthObserver = observer;
+		if (!observer) this.pendingObservedWidth = undefined;
+	}
+
+	private observeWidth(width: number): void {
+		if (this.observedWidth === width) return;
+		this.observedWidth = width;
+		if (!this.widthObserver) return;
+		this.pendingObservedWidth = width;
+		if (this.widthObserverScheduled) return;
+		this.widthObserverScheduled = true;
+		queueMicrotask(() => {
+			this.widthObserverScheduled = false;
+			const observed = this.pendingObservedWidth;
+			this.pendingObservedWidth = undefined;
+			if (observed !== undefined) this.widthObserver?.(observed);
+		});
+	}
+
 	invalidate(): void {
 		this.toolCachedValue = undefined;
 		this.toolCachedWidth = undefined;
@@ -2820,6 +3271,7 @@ class ToolText extends Text {
 	}
 
 	render(width: number): string[] {
+		this.observeWidth(width);
 		const branchKey = toolBranchRenderCacheKey();
 		if (
 			this.toolCachedLines
@@ -2836,7 +3288,9 @@ class ToolText extends Text {
 		}
 		const contentWidth = Math.max(1, width);
 		const lines = this.value.replace(/\t/g, "   ").split("\n");
-		const rendered = lines.flatMap((line) => wrapMarkedLine(line, contentWidth)).map((line) => padToWidth(line, width));
+		const rendered = lines
+			.flatMap((line) => wrapMarkedLine(line, contentWidth))
+			.map((line) => padToWidth(line, width));
 		this.toolCachedValue = this.value;
 		this.toolCachedWidth = width;
 		this.toolCachedLines = rendered;
@@ -2848,7 +3302,18 @@ class ToolText extends Text {
 
 function makeText(last: unknown, text: string): Text {
 	const component = last instanceof ToolText ? last : new ToolText();
+	component.setWidthObserver();
 	component.setText(text);
+	return component;
+}
+
+function makeResponsiveDiffText(ctx: any, last: unknown, text: string): Text {
+	const component = makeText(last, text) as ToolText;
+	component.setWidthObserver((width) => {
+		if (ctx.state?._diffComponentWidth === width) return;
+		if (ctx.state) ctx.state._diffComponentWidth = width;
+		safeInvalidate(ctx);
+	});
 	return component;
 }
 
@@ -2868,6 +3333,29 @@ function expandedPreviewLimit(): number {
 function bashCollapsedLimit(): number {
 	const value = readSettings().bashCollapsedLines;
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 10;
+}
+
+function bashCommandPreviewLimit(): number {
+	const value = readSettings().bashCommandPreviewLines;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 8;
+}
+
+function renderBashCommandBlock(
+	command: string,
+	expanded: boolean,
+	theme: Theme,
+): string {
+	const presentation = buildBashCommandPresentation(command);
+	const limit = bashCommandPreviewLimit();
+	if (!expanded && (limit === 0 || presentation.sourceLineCount < 2)) return "";
+	const sourceLimit = expandedPreviewLimit();
+	const lines = expanded ? presentation.sourceLines.slice(0, sourceLimit) : buildBashPreview(presentation.sourceLines, limit);
+	if (lines.length === 0) return "";
+	if (expanded && presentation.sourceLines.length > sourceLimit) {
+		lines.push(`... ${presentation.sourceLines.length - sourceLimit} more command lines`);
+	}
+	const body = lines.map((line) => theme.fg("accent", line || " ")).join("\n");
+	return expanded ? withBranch(body, theme, false, true) : withClippedBranch(body, theme, true);
 }
 
 function liveToolPreviewEnabled(): boolean {
@@ -3336,12 +3824,12 @@ function rebindUiChromeToTheme(ctx: any): void {
 	const theme = ctx.ui?.theme;
 	invalidateThemePaletteCache();
 	clearHighlightCache();
-	autoDerivePending = true;
+	applyDiffPalette();
 	bustSpinnerSettingsCache();
 	applyToolBackgroundMode(theme);
 	applyThemePaletteIfNeeded(theme);
 	syncDiffShikiTheme(theme);
-	if (themeAdaptiveEnabled() && theme?.getFgAnsi) {
+	if (themeAdaptiveEnabled() && theme?.getFgAnsi && !hasExplicitBgConfig) {
 		autoDeriveBgFromTheme(theme);
 		autoDerivePending = false;
 	}
@@ -3576,6 +4064,7 @@ function applyThemePaletteIfNeeded(theme: any): void {
 
 function applyDiffPalette(): void {
 	const config = loadDiffConfig();
+	hasExplicitBgConfig = false;
 	const preset = config.diffTheme ? DIFF_PRESETS[config.diffTheme] : null;
 	if (preset) hasExplicitBgConfig = true;
 	const overrides = config.diffColors ?? {};
@@ -3696,8 +4185,15 @@ function termW(): number {
 	return Math.max(40, Math.min(raw - 4, MAX_TERM_WIDTH));
 }
 
-function branchDiffWidth(): number {
-	return Math.max(40, termW() - 8);
+function branchDiffWidth(componentWidth?: number, chromeWidth = 2): number {
+	const width = typeof componentWidth === "number" && Number.isFinite(componentWidth)
+		? Math.floor(componentWidth)
+		: termW();
+	return Math.max(20, Math.min(width - chromeWidth, MAX_TERM_WIDTH));
+}
+
+function contextDiffWidth(ctx: any, chromeWidth = 2): number {
+	return branchDiffWidth(ctx.state?._diffComponentWidth, chromeWidth);
 }
 
 function adaptiveWrapRows(tw?: number): number {
@@ -4557,7 +5053,7 @@ function renderEditPreviewBody(
 	summary: string,
 ): void {
 	const dc = resolveDiffColors(theme);
-	const branchWidth = branchDiffWidth();
+	const branchWidth = contextDiffWidth(ctx, 3);
 	if (operations.length === 1) {
 		const [diff] = diffs;
 		const line = lines[0] ?? getFirstChangedNewLine(diff);
@@ -4655,16 +5151,30 @@ function trackThinkingBlockEvents(event: any, ctx?: any): void {
 	}
 	if (evt.type === "thinking_end") {
 		thinkingBlockInFlight = false;
-		const duration = Date.now() - thinkingBlockStartMs;
+		const duration = Math.max(0, Date.now() - thinkingBlockStartMs);
 		if (message?.role === "assistant") delete (message as any)[THINKING_ACTIVE_KEY];
-		if (duration >= MIN_THINKING_SUMMARY_MS) {
-			lastThinkingBlockDurationMs = duration;
-			if (message?.role === "assistant") (message as any)[THINKING_DURATION_KEY] = duration;
-		} else {
-			lastThinkingBlockDurationMs = undefined;
-			if (message?.role === "assistant") delete (message as any)[THINKING_DURATION_KEY];
-		}
+		lastThinkingBlockDurationMs = duration;
+		if (message?.role === "assistant") (message as any)[THINKING_DURATION_KEY] = duration;
 		refreshThinkingChrome();
+		return;
+	}
+	// Fallback: some providers/models never emit thinking_end (a second
+	// thinking_start can overwrite the first, or the turn can end with toolUse).
+	// The live "Thinking..." row would otherwise stick forever while later calls
+	// run normally. Any non-thinking stream event on the same assistant message
+	// means thinking is no longer the live activity: freeze the elapsed time into
+	// a "Thought for Xs" duration so the row always resolves.
+	if ((message as any)?.[THINKING_ACTIVE_KEY] || thinkingBlockInFlight) {
+		if (evt.type === "text_start" || evt.type === "text_delta" || evt.type === "toolcall_start" || evt.type === "toolcall_end") {
+			thinkingBlockInFlight = false;
+			const duration = thinkingBlockStartMs > 0 ? Math.max(0, Date.now() - thinkingBlockStartMs) : undefined;
+			if (message?.role === "assistant") delete (message as any)[THINKING_ACTIVE_KEY];
+			if (typeof duration === "number") {
+				lastThinkingBlockDurationMs = duration;
+				if (message?.role === "assistant") (message as any)[THINKING_DURATION_KEY] = duration;
+			}
+			refreshThinkingChrome();
+		}
 	}
 }
 
@@ -4690,7 +5200,6 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 		}
 		if (sessionStartMs === undefined) sessionStartMs = Date.now();
 		currentAssistantMessageStartMs = undefined;
-		thinkingBlockInFlight = false;
 	});
 	pi.on("agent_start", async () => {
 		if (currentAgentWorkStartMs === undefined) {
@@ -4707,6 +5216,10 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 		if (message?.role === "assistant") {
 			currentAssistantMessageStartMs = Date.now();
 			(message as any)[WORKED_START_KEY] = currentAssistantMessageStartMs;
+			// A new assistant message starts a fresh thinking lifecycle. Without
+			// this, a missing thinking_end on the previous message leaves the
+			// global in-flight flag set and the next message renders a stale
+			// "Thinking..." row until its own thinking events arrive.
 			thinkingBlockInFlight = false;
 			delete (message as any)[THINKING_ACTIVE_KEY];
 		}
@@ -4718,9 +5231,22 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 	pi.on("message_end", async (event, ctx) => {
 		const message = (event as any)?.message;
 		if (message?.role === "assistant") {
-			if (typeof lastThinkingBlockDurationMs === "number") {
-				(message as any)[THINKING_DURATION_KEY] = lastThinkingBlockDurationMs;
+			// Belt-and-suspenders: if thinking_end never fired (provider skipped
+			// it, or the turn ended on toolUse/text), freeze any live "Thinking..."
+			// into its "Thought for Xs" duration here so the row always resolves
+			// at the end of the message instead of sticking into later calls.
+			thinkingBlockInFlight = false;
+			delete (message as any)[THINKING_ACTIVE_KEY];
+			if (typeof (message as any)[THINKING_DURATION_KEY] !== "number") {
+				const duration = thinkingBlockStartMs > 0 ? Math.max(0, Date.now() - thinkingBlockStartMs) : undefined;
+				if (typeof duration === "number" && duration > 0) {
+					lastThinkingBlockDurationMs = duration;
+					(message as any)[THINKING_DURATION_KEY] = duration;
+				} else if (typeof lastThinkingBlockDurationMs === "number" && lastThinkingBlockDurationMs > 0) {
+					(message as any)[THINKING_DURATION_KEY] = lastThinkingBlockDurationMs;
+				}
 			}
+			thinkingBlockStartMs = 0;
 			const started = typeof currentAgentWorkStartMs === "number"
 				? currentAgentWorkStartMs
 				: typeof (message as any)[WORKED_START_KEY] === "number"
@@ -4734,15 +5260,16 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 				(message as any)[WORKED_DURATION_KEY] = durationMs;
 				if (typeof sessionTotalMs === "number") (message as any)[WORKED_SESSION_TOTAL_KEY] = sessionTotalMs;
 				if (typeof turns === "number") (message as any)[WORKED_TURNS_KEY] = turns;
-				// Mutate the message itself before pi renders/persists it. This is more
-				// reliable than the spinner because pi removes the loader on agent_end,
-				// and more reliable than component monkey-patching when extensions are
-				// loaded from a different package instance than the running TUI.
-				appendWorkedDurationLine(message, durationMs, sessionTotalMs, turns);
+				// Duration metadata drives the assistant component's TUI-only status line.
+				// Message content stays presentation-neutral for persistence and consumers.
 			}
 			currentAssistantMessageStartMs = undefined;
 		}
 		patchMessage(event, ctx.ui?.theme);
+		try {
+			(ctx as any)?.ui?.invalidate?.();
+			(ctx as any)?.ui?.requestRender?.();
+		} catch { /* noop */ }
 	});
 	pi.on("agent_end", async () => {
 		currentAgentWorkStartMs = undefined;
@@ -5374,7 +5901,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	}
 	ctx.state._openAiPatchFiles = preview.changes.map((change) => change.displayPath);
 
-	const diffWidth = branchDiffWidth();
+	const diffWidth = contextDiffWidth(ctx);
 	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 	if (ctx.state._applyPatchPreviewKey !== key) {
 		ctx.state._applyPatchPreviewKey = key;
@@ -5427,7 +5954,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	}
 
 	const body = ctx.state._applyPatchPreviewDisplay as string | undefined;
-	return makeText(ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
+	return makeResponsiveDiffText(ctx, ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
 }
 
 function renderApplyPatchResult(result: any, isPartial: boolean, theme: Theme, ctx: any): Text {
@@ -5776,6 +6303,7 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 // ===========================================================================
 
 export default function (pi: ExtensionAPI) {
+	patchTerminalWriteTagScrubber();
 	patchToolExecutionBackgroundSync();
 	patchToolRenderCacheInvalidation();
 	patchReadImageExpansion();
@@ -5803,7 +6331,7 @@ export default function (pi: ExtensionAPI) {
 	// /cc-tools command — control tool chrome, grouping, and detail level.
 	const TOOL_MODES = ["outlines", "transparent", "default"] as const;
 	const TOOL_BOOL_MODES = ["on", "off", "toggle", "status"] as const;
-	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "branch", "status"] as const;
+	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "thinking", "branch", "status"] as const;
 	const booleanMode = (raw: string | undefined, current: boolean): boolean | "status" | undefined => {
 		const mode = raw || "toggle";
 		if (mode === "on") return true;
@@ -5826,6 +6354,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
+			`Thinking: ${getThinkingMode()}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
 			branchLine,
 			`  /cc-tools branch <0-255> | theme | fixed | reset`,
@@ -5844,6 +6373,7 @@ export default function (pi: ExtensionAPI) {
 						label: m,
 						description:
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
+							: m === "thinking" ? "Thinking display: live (default) or full"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
 							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
 							: m === "status" ? "Show tool UI settings"
@@ -5858,6 +6388,12 @@ export default function (pi: ExtensionAPI) {
 				return opts
 					.filter((o) => o.startsWith(second))
 					.map((o) => ({ value: `branch ${o}`, label: o, description: "Branch connector color" }));
+			}
+			if (first === "thinking") {
+				const second = parts[1] ?? "";
+				return ["live", "full", "status"]
+					.filter((m) => m.startsWith(second))
+					.map((m) => ({ value: `thinking ${m}`, label: m, description: `${m} thinking display` }));
 			}
 			if (first === "group" || first === "detail" || first === "extra") {
 				const second = parts[1] ?? "";
@@ -5931,6 +6467,24 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "thinking") {
+				const arg = (parts[1] ?? "status").toLowerCase();
+				if (arg === "status" || !arg) {
+					if (ctx.hasUI) ctx.ui.notify(`Thinking: ${getThinkingMode()} (live = only streaming thinking expands; full = always expanded)`, "info");
+					return;
+				}
+				if (arg !== "live" && arg !== "full") {
+					if (ctx.hasUI) ctx.ui.notify("Usage: /cc-tools thinking live|full|status", "error");
+					return;
+				}
+				writeSettingsKey("thinkingMode", arg);
+				if (ctx.hasUI) {
+					ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
+					ctx.ui.notify(`Thinking → ${arg}${arg === "live" ? " (only the active thinking expands)" : " (thinking always expanded)"}`, "info");
+				}
+				return;
+			}
+
 			if (sub === "detail" || sub === "extra") {
 				const next = booleanMode(parts[1], extraToolOutputExpanded);
 				if (next === undefined) {
@@ -5950,7 +6504,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!(TOOL_MODES as readonly string[]).includes(sub)) {
-				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools branch 72, or /cc-tools group toggle.`, "error");
+				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools thinking live, or /cc-tools group toggle.`, "error");
 				return;
 			}
 			toolBackgroundOverride = sub as typeof toolBackgroundMode;
@@ -6244,15 +6798,27 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderCall(args, theme, ctx) {
 			syncToolCallStatus(ctx);
+			syncBashDuration(ctx);
 			const rewrite = ensureRtkRewriteForContext(ctx, args);
-			const summary = stableCallSummary(ctx, "_callSummary", () => summarizeText(args.command, 72));
+			const command = typeof args.command === "string" ? args.command : "";
+			const presentation = buildBashCommandPresentation(command);
+			const summary = stableCallSummary(ctx, "_bashHeadline", () => presentation.headline);
 			const rtkBadge = rewrite ? theme.fg("muted", " (RTK)") : "";
-			return makeText(
-				ctx.lastComponent,
-				toolHeader("Bash", `${summary}${rtkBadge}`, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
-			);
+			const status = ctx?.state?._toolStatus;
+			const showCommand = ctx.argsComplete === true && (status === "pending" || status === "error" || ctx.expanded === true);
+			const commandBlock = showCommand ? renderBashCommandBlock(command, ctx.expanded === true, theme) : "";
+			const headerSummary = ctx.expanded === true && commandBlock ? describeBashSource(presentation) : summary;
+			const header = toolHeader(
+				"Bash",
+				`${headerSummary}${rtkBadge}`,
+				theme,
+				toolStatusDot(ctx, theme),
+				bashHeaderTrailing(ctx, theme),
+			).replace(WRAP_MARK, CLIP_MARK);
+			return makeText(ctx.lastComponent, commandBlock ? `${header}\n${commandBlock}` : header);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
+			syncBashDuration(ctx, isPartial);
 			const details = result.details as BashToolDetails | undefined;
 			const rewrite = ensureRtkRewriteForContext(ctx, ctx.args);
 			const output = result.content[0]?.type === "text" ? result.content[0].text : "";
@@ -6497,7 +7063,7 @@ export default function (pi: ExtensionAPI) {
 			if (d?._type === "diff") {
 				const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
 				const hunks = d.diff?.lines?.filter((l: any) => l.type === "sep").length + (d.diff?.lines?.length ? 1 : 0);
-				const diffWidth = branchDiffWidth();
+				const diffWidth = contextDiffWidth(ctx);
 				const mode = shouldUseSplit(d.diff, diffWidth, previewLines) ? "split" : "unified";
 				const richSummary = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
 				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}`;
@@ -6517,7 +7083,7 @@ export default function (pi: ExtensionAPI) {
 							safeInvalidate(ctx);
 						});
 				}
-				return makeText(ctx.lastComponent, ctx.state._wdt ?? withBranch(richSummary, theme));
+				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._wdt ?? withBranch(richSummary, theme));
 			}
 			if (d?._type === "noChange") return makeText(ctx.lastComponent, withBranch(theme.fg("muted", "✓ no changes"), theme));
 			if (d?._type === "new") {
@@ -6527,7 +7093,7 @@ export default function (pi: ExtensionAPI) {
 				const syntheticDiff = getCachedParsedDiff(ctx, `nf-diff:${d.filePath}:${contentHash}`, "", content);
 				const richSummary = diffSummaryWithMeta(syntheticDiff.added, 0, 1, "new file");
 				const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
-				const diffWidth = branchDiffWidth();
+				const diffWidth = contextDiffWidth(ctx);
 				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 				if (ctx.state._nfk !== pk) {
 					ctx.state._nfk = pk;
@@ -6545,7 +7111,7 @@ export default function (pi: ExtensionAPI) {
 							safeInvalidate(ctx);
 						});
 				}
-				return makeText(ctx.lastComponent, ctx.state._nft ?? withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme));
+				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._nft ?? withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme));
 			}
 			return makeText(ctx.lastComponent, withBranch(theme.fg("success", "Written"), theme));
 		},
@@ -6600,7 +7166,7 @@ export default function (pi: ExtensionAPI) {
 			syncToolCallStatus(ctx);
 			const hdr = toolHeader("Edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`, liveLineCountTrailing(ctx, theme));
 			if (!(ctx.argsComplete && operations.length > 0)) return makeText(ctx.lastComponent, hdr);
-			const diffWidth = branchDiffWidth();
+			const diffWidth = contextDiffWidth(ctx, 3);
 			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 			const { diffs: fallbackDiffs, summary: editSummary } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
@@ -6620,8 +7186,8 @@ export default function (pi: ExtensionAPI) {
 						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), editSummary);
 					});
 			}
-				const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);
-			return makeText(ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
+			const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);
+			return makeResponsiveDiffText(ctx, ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -6774,6 +7340,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		_clearAllBlinkContexts();
+		clearAllBashDurationContexts();
 		clearRtkRewriteState();
 		WRITE_EXISTED_BEFORE.clear();
 		clearHighlightCache();

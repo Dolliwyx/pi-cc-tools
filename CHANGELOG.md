@@ -3,6 +3,43 @@
 > [!IMPORTANT]
 > **1.0.69 — package rename (permanent).** Canonical npm name is now [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui). `pi-claude-style-tools` is legacy and will not receive further releases. Install with `pi install npm:pi-claude-code-ui` or `npm i pi-claude-code-ui`.
 
+## 1.0.80 — 2026-08-24
+
+### Fixed
+
+- **Scrub Magic Context tags at the terminal writer** — last-resort display filter at the `ProcessTerminal.write` choke point removes every complete `§N§` token from painted output, covering any surface the targeted render strips can't reach: mid-sentence tag references in ctx_reduce/system-reminder tool output, replayed history on resume, overlays, and search hits. Display only — session storage, LLM context, copy sources, and ANSI sequences are untouched, so plugin functionality is unaffected.
+
+## 1.0.79 — 2026-08-23
+
+### Fixed
+
+- **Hide Magic Context tags in tool output** — tool result renderers now receive sanitized text, so transient `§N§` tags (including live-prefixed streaming chunks and queued ctx_reduce output replayed from history) no longer appear in tool rows. Storage is never mutated — result blocks are cloned only when a tag is present, so context management keeps its data. Also covers the `formatToolExecution` fallback path for renderer-less tools.
+
+## 1.0.78 — 2026-08-22
+
+### Fixed
+
+- **Hide transient Magic Context tags** — dynamically filter Magic Context tags (like `§N§`) from all Markdown view components in the Terminal UI. This covers thinking blocks, user messages, assistant prose, and subagent frames, without mutating the underlying message text content or breaking LLM prompt tracking.
+
+## 1.0.77 — 2026-08-21
+
+### Fixed
+
+- **Dynamic Turn Took lines** — the end line `✻ Turn took xs` is now rendered dynamically in the Terminal UI instead of being baked into the message text content. This avoids polluting saved session databases and other UIs (like VSCode or web interfaces), and prevents interference with tools like TPS counters that read the message text.
+
+## 1.0.76 — 2026-08-07
+
+### Fixed
+
+- **Hide transient context tags** — hide transient context tags in streaming prose.
+
+## Unreleased
+
+### Fixed
+
+- **Grouped Bash commands show live progress** (Raine Virta) - collapsed running Bash rows display their latest non-empty output line beneath the command.
+- **Final timing status stays presentation-only** (Raine Virta) - the `Turn took` line renders as a styled TUI component without adding ANSI escapes or display text to persisted assistant messages.
+
 ## 1.0.75 — 2026-07-29
 
 ### Fixed
